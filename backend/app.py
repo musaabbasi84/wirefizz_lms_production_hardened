@@ -4,7 +4,18 @@ from pathlib import Path
 import csv, io, os, uuid
 
 from flask import Flask, jsonify, request, Response, send_from_directory
-from flask_jwt_extended import create_access_token, create_refresh_token, decode_token, get_jwt, get_jwt_identity, jwt_required, set_access_cookies, set_refresh_cookies, unset_jwt_cookies
+from flask_jwt_extended import (
+    create_access_token,
+    create_refresh_token,
+    decode_token,
+    get_csrf_token,
+    get_jwt,
+    get_jwt_identity,
+    jwt_required,
+    set_access_cookies,
+    set_refresh_cookies,
+    unset_jwt_cookies,
+)
 from sqlalchemy import func, or_, inspect, text, case
 from email_validator import validate_email, EmailNotValidError
 from werkzeug.utils import secure_filename
@@ -42,23 +53,47 @@ def paginated(query, default=25, max_per=100):
         per = min(max(1, int(request.args.get("per_page", default))), max_per)
     except ValueError:
         page, per = 1, default
+
     total = query.order_by(None).count()
     rows = query.limit(per).offset((page - 1) * per).all()
-    return rows, {"page": page, "per_page": per, "total": total, "pages": (total + per - 1) // per}
+
+    return rows, {
+        "page": page,
+        "per_page": per,
+        "total": total,
+        "pages": (total + per - 1) // per
+    }
 
 
 def create_app():
     app = Flask(__name__)
     app.config.from_object(Config)
-    if Config.APP_ENV == 'production':
-        if Config.SECRET_KEY in ('change-me', '') or Config.JWT_SECRET_KEY in ('change-me-too', ''):
-            raise RuntimeError('Production secrets are not configured. Set SECRET_KEY and JWT_SECRET_KEY.')
-        if '*' in Config.CORS_ORIGINS:
-            raise RuntimeError("Production CORS_ORIGINS must not contain '*'.")
+
+    if Config.APP_ENV == "production":
+        if Config.SECRET_KEY in ("change-me", "") or Config.JWT_SECRET_KEY in ("change-me-too", ""):
+            raise RuntimeError(
+                "Production secrets are not configured. Set SECRET_KEY and JWT_SECRET_KEY."
+            )
+
+        if "*" in Config.CORS_ORIGINS:
+            raise RuntimeError(
+                "Production CORS_ORIGINS must not contain '*'."
+            )
+
     db.init_app(app)
     jwt.init_app(app)
     limiter.init_app(app)
-    cors.init_app(app, resources={r"/api/*": {"origins": Config.CORS_ORIGINS, "supports_credentials": True}}, supports_credentials=True)
+
+    cors.init_app(
+        app,
+        resources={
+            r"/api/*": {
+                "origins": Config.CORS_ORIGINS,
+                "supports_credentials": True
+            }
+        },
+        supports_credentials=True
+    )
 
     upload_dir = Path(Config.UPLOAD_DIR)
     avatar_dir = upload_dir / "profile"
@@ -66,42 +101,86 @@ def create_app():
 
     with app.app_context():
         db.create_all()
-        # Compatibility bootstrap for earlier WireFizz databases. For new production databases, run migrations before startup.
+
+        # Compatibility bootstrap for earlier WireFizz databases.
+        # For new production databases, run migrations before startup.
         migrate_legacy_schema()
 
     @app.after_request
     def security_headers(resp):
-        resp.headers.setdefault("X-Content-Type-Options", "nosniff")
-        resp.headers.setdefault("X-Frame-Options", "DENY")
-        resp.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
-        resp.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+        resp.headers.setdefault(
+            "X-Content-Type-Options",
+            "nosniff"
+        )
+        resp.headers.setdefault(
+            "X-Frame-Options",
+            "DENY"
+        )
+        resp.headers.setdefault(
+            "Referrer-Policy",
+            "strict-origin-when-cross-origin"
+        )
+        resp.headers.setdefault(
+            "Permissions-Policy",
+            "camera=(), microphone=(), geolocation=()"
+        )
+
         if Config.APP_ENV == "production":
-            resp.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+            resp.headers.setdefault(
+                "Strict-Transport-Security",
+                "max-age=31536000; includeSubDomains"
+            )
+
         return resp
 
     @app.errorhandler(413)
-    def too_large(_): return jsonify({"error": "Request payload is too large."}), 413
+    def too_large(_):
+        return jsonify({
+            "error": "Request payload is too large."
+        }), 413
+
     @app.errorhandler(429)
-    def rate_limited(_): return jsonify({"error": "Too many requests. Please try again shortly."}), 429
+    def rate_limited(_):
+        return jsonify({
+            "error": "Too many requests. Please try again shortly."
+        }), 429
 
     @jwt.unauthorized_loader
-    def jwt_missing(_): return jsonify({"error": "Authentication required."}), 401
+    def jwt_missing(_):
+        return jsonify({
+            "error": "Authentication required."
+        }), 401
 
     @jwt.invalid_token_loader
-    def jwt_invalid(_): return jsonify({"error": "Invalid authentication token."}), 401
+    def jwt_invalid(_):
+        return jsonify({
+            "error": "Invalid authentication token."
+        }), 401
 
     @jwt.expired_token_loader
-    def jwt_expired(_header, _payload): return jsonify({"error": "Authentication token expired."}), 401
+    def jwt_expired(_header, _payload):
+        return jsonify({
+            "error": "Authentication token expired."
+        }), 401
 
     @jwt.revoked_token_loader
-    def jwt_revoked(_header, _payload): return jsonify({"error": "Authentication session revoked."}), 401
+    def jwt_revoked(_header, _payload):
+        return jsonify({
+            "error": "Authentication session revoked."
+        }), 401
 
     @jwt.needs_fresh_token_loader
-    def jwt_fresh_required(_header, _payload): return jsonify({"error": "A fresh authentication token is required."}), 401
+    def jwt_fresh_required(_header, _payload):
+        return jsonify({
+            "error": "A fresh authentication token is required."
+        }), 401
 
     def get_user():
-        try: uid = int(get_jwt_identity())
-        except (TypeError, ValueError): return None
+        try:
+            uid = int(get_jwt_identity())
+        except (TypeError, ValueError):
+            return None
+
         return db.session.get(User, uid)
 
     def require_user(*roles):
@@ -110,22 +189,66 @@ def create_app():
             @jwt_required()
             def wrapped(*args, **kwargs):
                 user = get_user()
+
                 if not user or user.account_status != "active":
-                    return jsonify({"error": "Account unavailable."}), 403
+                    return jsonify({
+                        "error": "Account unavailable."
+                    }), 403
+
                 if roles and user.role not in roles:
-                    return jsonify({"error": "Forbidden."}), 403
+                    return jsonify({
+                        "error": "Forbidden."
+                    }), 403
+
                 return fn(user, *args, **kwargs)
+
             return wrapped
+
         return deco
 
-    def audit(user_id, action, entity_type=None, entity_id=None, details=None):
-        db.session.add(AuditLog(user_id=user_id, action=action, entity_type=entity_type, entity_id=entity_id,
-                                details=(details or "")[:2000], ip_address=request.headers.get("X-Forwarded-For", request.remote_addr),
-                                user_agent=request.headers.get("User-Agent", "")[:500]))
+    def audit(
+        user_id,
+        action,
+        entity_type=None,
+        entity_id=None,
+        details=None
+    ):
+        db.session.add(
+            AuditLog(
+                user_id=user_id,
+                action=action,
+                entity_type=entity_type,
+                entity_id=entity_id,
+                details=(details or "")[:2000],
+                ip_address=request.headers.get(
+                    "X-Forwarded-For",
+                    request.remote_addr
+                ),
+                user_agent=request.headers.get(
+                    "User-Agent",
+                    ""
+                )[:500]
+            )
+        )
 
-    def notify(user_id, title, message, kind="info", entity_type=None, entity_id=None):
-        db.session.add(Notification(user_id=user_id, title=title, message=message, kind=kind,
-                                    entity_type=entity_type, entity_id=entity_id))
+    def notify(
+        user_id,
+        title,
+        message,
+        kind="info",
+        entity_type=None,
+        entity_id=None
+    ):
+        db.session.add(
+            Notification(
+                user_id=user_id,
+                title=title,
+                message=message,
+                kind=kind,
+                entity_type=entity_type,
+                entity_id=entity_id
+            )
+        )
 
     def visible_lead(user, lead):
         return user.role == "admin" or lead.ambassador_id == user.id
@@ -135,535 +258,2644 @@ def create_app():
     def health():
         try:
             db.session.execute(text("SELECT 1"))
-            return jsonify({"status": "ok", "database": "ok", "service": "WireFizz LMS API"})
+
+            return jsonify({
+                "status": "ok",
+                "database": "ok",
+                "service": "WireFizz LMS API"
+            })
+
         except Exception:
-            return jsonify({"status": "degraded", "database": "unavailable", "service": "WireFizz LMS API"}), 503
+            return jsonify({
+                "status": "degraded",
+                "database": "unavailable",
+                "service": "WireFizz LMS API"
+            }), 503
 
     @app.post("/api/auth/register")
     @limiter.limit("5 per minute")
     def register():
         data = request.get_json(silent=True) or {}
-        full_name, email, phone, password = [str(data.get(k, "")).strip() for k in ("full_name", "email", "phone", "password")]
-        email = email.lower()
-        if not full_name or not email or not password: return jsonify({"error": "Full name, email and password are required."}), 400
-        if len(password) < 8: return jsonify({"error": "Password must be at least 8 characters."}), 400
-        if len(full_name) > 120: return jsonify({"error": "Full name is too long."}), 400
-        try: validate_email(email)
-        except EmailNotValidError: return jsonify({"error": "Please provide a valid email address."}), 400
-        if User.query.filter(func.lower(User.email) == email).first(): return jsonify({"error": "An account with this email already exists."}), 409
-        status = "active" if Config.AUTO_APPROVE_REGISTRATION else "pending"
-        user = User(full_name=full_name, email=email, phone=phone or None, role="ambassador", account_status=status, is_active=(status == "active"))
-        user.set_password(password)
-        db.session.add(user); db.session.flush()
-        audit(user.id, "account_registered", "user", user.id, f"Ambassador account created with status {status}")
-        db.session.commit()
-        if status != "active": return jsonify({"message": "Registration submitted for admin approval."}), 201
-        return jsonify({"message": "Account created. You can now sign in."}), 201
 
-    def issue_session(user, resp):
-        access = create_access_token(identity=str(user.id), additional_claims={"role": user.role})
-        refresh = create_refresh_token(identity=str(user.id), additional_claims={"role": user.role})
-        claims = decode_token(refresh, allow_expired=False)
-        now_utc = now()
-        db.session.add(RefreshSession(user_id=user.id, jti=claims["jti"], issued_at=now_utc,
-                                      expires_at=datetime.fromtimestamp(claims["exp"], tz=timezone.utc),
-                                      user_agent=request.headers.get("User-Agent", "")[:500],
-                                      ip_address=request.headers.get("X-Forwarded-For", request.remote_addr)))
+        full_name, email, phone, password = [
+            str(data.get(k, "")).strip()
+            for k in (
+                "full_name",
+                "email",
+                "phone",
+                "password"
+            )
+        ]
+
+        email = email.lower()
+
+        if not full_name or not email or not password:
+            return jsonify({
+                "error": "Full name, email and password are required."
+            }), 400
+
+        if len(password) < 8:
+            return jsonify({
+                "error": "Password must be at least 8 characters."
+            }), 400
+
+        if len(full_name) > 120:
+            return jsonify({
+                "error": "Full name is too long."
+            }), 400
+
+        try:
+            validate_email(email)
+        except EmailNotValidError:
+            return jsonify({
+                "error": "Please provide a valid email address."
+            }), 400
+
+        if User.query.filter(
+            func.lower(User.email) == email
+        ).first():
+            return jsonify({
+                "error": "An account with this email already exists."
+            }), 409
+
+        status = (
+            "active"
+            if Config.AUTO_APPROVE_REGISTRATION
+            else "pending"
+        )
+
+        user = User(
+            full_name=full_name,
+            email=email,
+            phone=phone or None,
+            role="ambassador",
+            account_status=status,
+            is_active=(status == "active")
+        )
+
+        user.set_password(password)
+
+        db.session.add(user)
+        db.session.flush()
+
+        audit(
+            user.id,
+            "account_registered",
+            "user",
+            user.id,
+            f"Ambassador account created with status {status}"
+        )
+
         db.session.commit()
-        set_access_cookies(resp, access); set_refresh_cookies(resp, refresh)
-        return resp
+
+        if status != "active":
+            return jsonify({
+                "message": "Registration submitted for admin approval."
+            }), 201
+
+        return jsonify({
+            "message": "Account created. You can now sign in."
+        }), 201
+
+    # IMPORTANT:
+    # This function must stay INSIDE create_app().
+    # It creates the access/refresh cookies and returns their CSRF tokens.
+    def issue_session(user):
+        access = create_access_token(
+            identity=str(user.id),
+            additional_claims={
+                "role": user.role
+            }
+        )
+
+        refresh = create_refresh_token(
+            identity=str(user.id),
+            additional_claims={
+                "role": user.role
+            }
+        )
+
+        access_claims = decode_token(
+            access,
+            allow_expired=False
+        )
+
+        refresh_claims = decode_token(
+            refresh,
+            allow_expired=False
+        )
+
+        now_utc = now()
+
+        db.session.add(
+            RefreshSession(
+                user_id=user.id,
+                jti=refresh_claims["jti"],
+                issued_at=now_utc,
+                expires_at=datetime.fromtimestamp(
+                    refresh_claims["exp"],
+                    tz=timezone.utc
+                ),
+                user_agent=request.headers.get(
+                    "User-Agent",
+                    ""
+                )[:500],
+                ip_address=request.headers.get(
+                    "X-Forwarded-For",
+                    request.remote_addr
+                )
+            )
+        )
+
+        db.session.commit()
+
+        response = jsonify({
+            "user": user.to_dict(),
+            "csrf_token": get_csrf_token(access_claims),
+            "refresh_csrf_token": get_csrf_token(refresh_claims)
+        })
+
+        set_access_cookies(
+            response,
+            access
+        )
+
+        set_refresh_cookies(
+            response,
+            refresh
+        )
+
+        return response
+
+    # Cross-domain CSRF helper.
+    #
+    # Frontend is hosted on Vercel while API is hosted on Render.
+    # Browser sends Render cookies with credentials, but JavaScript
+    # running on Vercel cannot read Render's document.cookie.
+    #
+    # This endpoint returns ONLY the CSRF tokens, never the JWT tokens.
+    @app.get("/api/auth/csrf")
+    @limiter.exempt
+    def csrf_tokens():
+        access_csrf = request.cookies.get(
+            Config.JWT_ACCESS_CSRF_COOKIE_NAME
+        )
+
+        refresh_csrf = request.cookies.get(
+            Config.JWT_REFRESH_CSRF_COOKIE_NAME
+        )
+
+        if not access_csrf and not refresh_csrf:
+            return jsonify({
+                "error": "No active session."
+            }), 401
+
+        response = jsonify({
+            "access_csrf": access_csrf,
+            "refresh_csrf": refresh_csrf
+        })
+
+        response.headers["Cache-Control"] = "no-store"
+
+        return response
 
     @app.post("/api/auth/login")
     @limiter.limit("10 per minute")
     def login():
         data = request.get_json(silent=True) or {}
-        email, password = str(data.get("email", "")).strip().lower(), data.get("password", "")
-        user = User.query.filter(func.lower(User.email) == email).first()
-        if not user or not user.check_password(password): return jsonify({"error": "Invalid email or password."}), 401
-        if user.account_status == "pending": return jsonify({"error": "Your account is awaiting admin approval."}), 403
-        if user.account_status == "blocked": return jsonify({"error": "Your account is blocked. Contact an administrator."}), 403
-        user.last_login_at = now(); audit(user.id, "login", "user", user.id, "Successful login"); db.session.commit()
-        return issue_session(user, jsonify({"user": user.to_dict()}))
+
+        email = str(
+            data.get("email", "")
+        ).strip().lower()
+
+        password = data.get(
+            "password",
+            ""
+        )
+
+        user = User.query.filter(
+            func.lower(User.email) == email
+        ).first()
+
+        if not user or not user.check_password(password):
+            return jsonify({
+                "error": "Invalid email or password."
+            }), 401
+
+        if user.account_status == "pending":
+            return jsonify({
+                "error": "Your account is awaiting admin approval."
+            }), 403
+
+        if user.account_status == "blocked":
+            return jsonify({
+                "error": "Your account is blocked. Contact an administrator."
+            }), 403
+
+        user.last_login_at = now()
+
+        audit(
+            user.id,
+            "login",
+            "user",
+            user.id,
+            "Successful login"
+        )
+
+        db.session.commit()
+
+        return issue_session(user)
 
     @app.post("/api/auth/refresh")
     @limiter.limit("30 per minute")
     @jwt_required(refresh=True)
     def refresh():
-        claims = get_jwt(); user = get_user()
-        session = RefreshSession.query.filter_by(jti=claims.get("jti"), user_id=int(get_jwt_identity())).first()
-        if not user or user.account_status != "active" or not session or not session.is_active:
-            return jsonify({"error": "Refresh session unavailable."}), 401
+        claims = get_jwt()
+        user = get_user()
+
+        session = RefreshSession.query.filter_by(
+            jti=claims.get("jti"),
+            user_id=int(get_jwt_identity())
+        ).first()
+
+        if (
+            not user
+            or user.account_status != "active"
+            or not session
+            or not session.is_active
+        ):
+            return jsonify({
+                "error": "Refresh session unavailable."
+            }), 401
+
         session.revoked_at = now()
-        audit(user.id, "session_rotated", "session", session.id, "Refresh token rotated")
-        resp = jsonify({"user": user.to_dict()}); return issue_session(user, resp)
+
+        audit(
+            user.id,
+            "session_rotated",
+            "session",
+            session.id,
+            "Refresh token rotated"
+        )
+
+        return issue_session(user)
 
     @app.post("/api/auth/logout")
     def logout():
-        # Revoke the refresh token if one is present. Access-cookie verification is optional
-        # because logout must remain idempotent after an access-token expiry.
+        # Revoke the refresh token if one is present.
+        # Logout remains idempotent after access-token expiry.
         user = None
+
         try:
             from flask_jwt_extended import verify_jwt_in_request
-            verify_jwt_in_request(optional=True, refresh=True)
+
+            verify_jwt_in_request(
+                optional=True,
+                refresh=True
+            )
+
             claims = get_jwt()
             ident = get_jwt_identity()
+
             if ident is not None:
-                user = db.session.get(User, int(ident))
+                user = db.session.get(
+                    User,
+                    int(ident)
+                )
+
             if claims.get("jti"):
-                session = RefreshSession.query.filter_by(jti=claims["jti"]).first()
-                if session and not session.revoked_at: session.revoked_at = now()
+                session = RefreshSession.query.filter_by(
+                    jti=claims["jti"]
+                ).first()
+
+                if session and not session.revoked_at:
+                    session.revoked_at = now()
+
         except Exception:
             pass
-        if user: audit(user.id, "logout", "user", user.id, "Logout")
+
+        if user:
+            audit(
+                user.id,
+                "logout",
+                "user",
+                user.id,
+                "Logout"
+            )
+
         db.session.commit()
-        resp = jsonify({"message": "Signed out."}); unset_jwt_cookies(resp); return resp
+
+        resp = jsonify({
+            "message": "Signed out."
+        })
+
+        unset_jwt_cookies(resp)
+
+        return resp
 
     @app.get("/api/auth/me")
     @require_user("admin", "ambassador")
-    def me(user): return jsonify({"user": user.to_dict()})
+    def me(user):
+        return jsonify({
+            "user": user.to_dict()
+        })
 
     @app.get("/api/uploads/profile/<path:filename>")
     @limiter.exempt
-    def profile_image(filename): return send_from_directory(avatar_dir, secure_filename(filename))
+    def profile_image(filename):
+        return send_from_directory(
+            avatar_dir,
+            secure_filename(filename)
+        )
 
     @app.get("/api/profile")
     @require_user("admin", "ambassador")
-    def profile(user): return jsonify({"user": user.to_dict()})
+    def profile(user):
+        return jsonify({
+            "user": user.to_dict()
+        })
 
     @app.patch("/api/profile")
     @require_user("admin", "ambassador")
     def update_profile(user):
         data = request.get_json(silent=True) or {}
-        name = str(data.get("full_name", user.full_name)).strip(); phone = str(data.get("phone", user.phone or "")).strip()
-        if not name: return jsonify({"error": "Full name is required."}), 400
-        user.full_name, user.phone = name[:120], (phone or None)
-        audit(user.id, "profile_updated", "user", user.id, "Profile information updated"); db.session.commit()
-        return jsonify({"message": "Profile updated.", "user": user.to_dict()})
+
+        name = str(
+            data.get(
+                "full_name",
+                user.full_name
+            )
+        ).strip()
+
+        phone = str(
+            data.get(
+                "phone",
+                user.phone or ""
+            )
+        ).strip()
+
+        if not name:
+            return jsonify({
+                "error": "Full name is required."
+            }), 400
+
+        user.full_name = name[:120]
+        user.phone = phone or None
+
+        audit(
+            user.id,
+            "profile_updated",
+            "user",
+            user.id,
+            "Profile information updated"
+        )
+
+        db.session.commit()
+
+        return jsonify({
+            "message": "Profile updated.",
+            "user": user.to_dict()
+        })
 
     @app.post("/api/profile/avatar")
     @require_user("admin", "ambassador")
     def upload_avatar(user):
         f = request.files.get("file")
-        if not f or not f.filename: return jsonify({"error": "Please select an image."}), 400
-        original = secure_filename(f.filename); ext = Path(original).suffix.lower().lstrip(".")
-        if ext not in IMAGE_EXT or f.mimetype not in IMAGE_MIME: return jsonify({"error": "Only PNG, JPG, JPEG and WEBP images are allowed."}), 400
+
+        if not f or not f.filename:
+            return jsonify({
+                "error": "Please select an image."
+            }), 400
+
+        original = secure_filename(f.filename)
+        ext = Path(original).suffix.lower().lstrip(".")
+
+        if (
+            ext not in IMAGE_EXT
+            or f.mimetype not in IMAGE_MIME
+        ):
+            return jsonify({
+                "error": "Only PNG, JPG, JPEG and WEBP images are allowed."
+            }), 400
+
         try:
-            image = Image.open(f.stream); image.verify(); f.stream.seek(0)
-        except (UnidentifiedImageError, OSError): return jsonify({"error": "The uploaded file is not a valid image."}), 400
-        filename = f"{user.id}_{uuid.uuid4().hex}.{ext}"; target = avatar_dir / filename; f.save(target)
-        old = user.profile_picture; user.profile_picture = f"/api/uploads/profile/{filename}"
-        audit(user.id, "profile_picture_updated", "user", user.id, "Profile picture uploaded"); db.session.commit()
-        if old and old.startswith("/api/uploads/profile/"):
+            image = Image.open(f.stream)
+            image.verify()
+            f.stream.seek(0)
+        except (
+            UnidentifiedImageError,
+            OSError
+        ):
+            return jsonify({
+                "error": "The uploaded file is not a valid image."
+            }), 400
+
+        filename = (
+            f"{user.id}_{uuid.uuid4().hex}.{ext}"
+        )
+
+        target = avatar_dir / filename
+        f.save(target)
+
+        old = user.profile_picture
+
+        user.profile_picture = (
+            f"/api/uploads/profile/{filename}"
+        )
+
+        audit(
+            user.id,
+            "profile_picture_updated",
+            "user",
+            user.id,
+            "Profile picture uploaded"
+        )
+
+        db.session.commit()
+
+        if old and old.startswith(
+            "/api/uploads/profile/"
+        ):
             p = avatar_dir / Path(old).name
-            if p.exists(): p.unlink(missing_ok=True)
-        return jsonify({"message": "Profile picture updated.", "user": user.to_dict()})
+
+            if p.exists():
+                p.unlink(missing_ok=True)
+
+        return jsonify({
+            "message": "Profile picture updated.",
+            "user": user.to_dict()
+        })
 
     @app.delete("/api/profile/avatar")
     @require_user("admin", "ambassador")
     def remove_avatar(user):
-        old = user.profile_picture; user.profile_picture = None
-        audit(user.id, "profile_picture_removed", "user", user.id, "Profile picture removed"); db.session.commit()
-        if old and old.startswith("/api/uploads/profile/"):
+        old = user.profile_picture
+        user.profile_picture = None
+
+        audit(
+            user.id,
+            "profile_picture_removed",
+            "user",
+            user.id,
+            "Profile picture removed"
+        )
+
+        db.session.commit()
+
+        if old and old.startswith(
+            "/api/uploads/profile/"
+        ):
             p = avatar_dir / Path(old).name
-            if p.exists(): p.unlink(missing_ok=True)
-        return jsonify({"message": "Profile picture removed.", "user": user.to_dict()})
+
+            if p.exists():
+                p.unlink(missing_ok=True)
+
+        return jsonify({
+            "message": "Profile picture removed.",
+            "user": user.to_dict()
+        })
 
     @app.post("/api/auth/change-password")
     @require_user("admin", "ambassador")
     @limiter.limit("5 per minute")
     def change_password(user):
-        data = request.get_json(silent=True) or {}; current, new = data.get("current_password", ""), data.get("new_password", "")
-        if not user.check_password(current): return jsonify({"error": "Current password is incorrect."}), 400
-        if len(new) < 8: return jsonify({"error": "New password must be at least 8 characters."}), 400
+        data = request.get_json(silent=True) or {}
+
+        current = data.get(
+            "current_password",
+            ""
+        )
+
+        new = data.get(
+            "new_password",
+            ""
+        )
+
+        if not user.check_password(current):
+            return jsonify({
+                "error": "Current password is incorrect."
+            }), 400
+
+        if len(new) < 8:
+            return jsonify({
+                "error": "New password must be at least 8 characters."
+            }), 400
+
         user.set_password(new)
-        RefreshSession.query.filter_by(user_id=user.id, revoked_at=None).update({"revoked_at": now()})
-        audit(user.id, "password_changed", "user", user.id, "Password changed; active refresh sessions revoked")
+
+        RefreshSession.query.filter_by(
+            user_id=user.id,
+            revoked_at=None
+        ).update({
+            "revoked_at": now()
+        })
+
+        audit(
+            user.id,
+            "password_changed",
+            "user",
+            user.id,
+            "Password changed; active refresh sessions revoked"
+        )
+
         db.session.commit()
-        resp = jsonify({"message": "Password changed. Please sign in again."}); unset_jwt_cookies(resp); return resp
+
+        resp = jsonify({
+            "message": "Password changed. Please sign in again."
+        })
+
+        unset_jwt_cookies(resp)
+
+        return resp
 
     @app.get("/api/dashboard/stats")
     @require_user("admin", "ambassador")
     def dashboard_stats(user):
-        q = Lead.query if user.role == "admin" else Lead.query.filter_by(ambassador_id=user.id)
+        q = (
+            Lead.query
+            if user.role == "admin"
+            else Lead.query.filter_by(
+                ambassador_id=user.id
+            )
+        )
+
         return jsonify({
-            "total": q.count(), "new": q.filter_by(status="new").count(), "contacted": q.filter_by(status="contacted").count(),
-            "qualified": q.filter_by(status="qualified").count(), "follow_up": q.filter_by(status="follow_up").count(), "converted": q.filter_by(status="converted").count(),
-            "pending": q.filter_by(approval_status="pending").count(), "accepted": q.filter_by(approval_status="accepted").count(), "rejected": q.filter_by(approval_status="rejected").count(),
-            "high_priority": q.filter_by(priority="high").count(), "due_followups": q.filter(Lead.next_follow_up_at <= now(), Lead.next_follow_up_at.is_not(None)).count(),
-            "ambassadors": User.query.filter_by(role="ambassador", account_status="active").count() if user.role == "admin" else 0,
-            "blocked": User.query.filter_by(role="ambassador", account_status="blocked").count() if user.role == "admin" else 0,
+            "total": q.count(),
+            "new": q.filter_by(status="new").count(),
+            "contacted": q.filter_by(status="contacted").count(),
+            "qualified": q.filter_by(status="qualified").count(),
+            "follow_up": q.filter_by(status="follow_up").count(),
+            "converted": q.filter_by(status="converted").count(),
+            "pending": q.filter_by(
+                approval_status="pending"
+            ).count(),
+            "accepted": q.filter_by(
+                approval_status="accepted"
+            ).count(),
+            "rejected": q.filter_by(
+                approval_status="rejected"
+            ).count(),
+            "high_priority": q.filter_by(
+                priority="high"
+            ).count(),
+            "due_followups": q.filter(
+                Lead.next_follow_up_at <= now(),
+                Lead.next_follow_up_at.is_not(None)
+            ).count(),
+            "ambassadors": (
+                User.query.filter_by(
+                    role="ambassador",
+                    account_status="active"
+                ).count()
+                if user.role == "admin"
+                else 0
+            ),
+            "blocked": (
+                User.query.filter_by(
+                    role="ambassador",
+                    account_status="blocked"
+                ).count()
+                if user.role == "admin"
+                else 0
+            ),
         })
 
     def leads_query(user):
-        return Lead.query if user.role == "admin" else Lead.query.filter_by(ambassador_id=user.id)
+        return (
+            Lead.query
+            if user.role == "admin"
+            else Lead.query.filter_by(
+                ambassador_id=user.id
+            )
+        )
 
     @app.get("/api/leads")
     @require_user("admin", "ambassador")
     def list_leads(user):
         q = leads_query(user)
-        for param, column, allowed in [("status", Lead.status, PIPELINE), ("approval_status", Lead.approval_status, APPROVAL), ("priority", Lead.priority, PRIORITY)]:
-            v = request.args.get(param); q = q.filter(column == v) if v in allowed else q
-        source = request.args.get("source"); ambassador_id = request.args.get("ambassador_id")
-        if source: q = q.filter(Lead.source == source)
+
+        for param, column, allowed in [
+            ("status", Lead.status, PIPELINE),
+            ("approval_status", Lead.approval_status, APPROVAL),
+            ("priority", Lead.priority, PRIORITY)
+        ]:
+            v = request.args.get(param)
+
+            if v in allowed:
+                q = q.filter(column == v)
+
+        source = request.args.get("source")
+        ambassador_id = request.args.get("ambassador_id")
+
+        if source:
+            q = q.filter(
+                Lead.source == source
+            )
+
         if user.role == "admin" and ambassador_id:
-            try: q = q.filter(Lead.ambassador_id == int(ambassador_id))
-            except ValueError: pass
-        search = request.args.get("search", "").strip()
+            try:
+                q = q.filter(
+                    Lead.ambassador_id == int(
+                        ambassador_id
+                    )
+                )
+            except ValueError:
+                pass
+
+        search = request.args.get(
+            "search",
+            ""
+        ).strip()
+
         if search:
-            p = f"%{search}%"; q = q.filter(or_(Lead.full_name.ilike(p), Lead.email.ilike(p), Lead.phone.ilike(p), Lead.city.ilike(p), Lead.institution.ilike(p), Lead.program_interest.ilike(p)))
-        rows, meta = paginated(q.order_by(Lead.created_at.desc()))
-        return jsonify({"leads": [x.to_dict() for x in rows], "pagination": meta})
+            p = f"%{search}%"
+
+            q = q.filter(
+                or_(
+                    Lead.full_name.ilike(p),
+                    Lead.email.ilike(p),
+                    Lead.phone.ilike(p),
+                    Lead.city.ilike(p),
+                    Lead.institution.ilike(p),
+                    Lead.program_interest.ilike(p)
+                )
+            )
+
+        rows, meta = paginated(
+            q.order_by(
+                Lead.created_at.desc()
+            )
+        )
+
+        return jsonify({
+            "leads": [
+                x.to_dict()
+                for x in rows
+            ],
+            "pagination": meta
+        })
 
     @app.post("/api/leads")
     @require_user("ambassador")
     def create_lead(user):
-        d = request.get_json(silent=True) or {}; name, phone = str(d.get("full_name", "")).strip(), str(d.get("phone", "")).strip()
-        email = str(d.get("email", "")).strip().lower() or None
-        if not name or not phone: return jsonify({"error": "Lead name and phone are required."}), 400
+        d = request.get_json(silent=True) or {}
+
+        name = str(
+            d.get("full_name", "")
+        ).strip()
+
+        phone = str(
+            d.get("phone", "")
+        ).strip()
+
+        email = (
+            str(
+                d.get("email", "")
+            ).strip().lower()
+            or None
+        )
+
+        if not name or not phone:
+            return jsonify({
+                "error": "Lead name and phone are required."
+            }), 400
+
         if email:
-            try: validate_email(email)
-            except EmailNotValidError: return jsonify({"error": "Lead email is invalid."}), 400
+            try:
+                validate_email(email)
+            except EmailNotValidError:
+                return jsonify({
+                    "error": "Lead email is invalid."
+                }), 400
+
         norm = normalize_phone(phone)
-        dup = Lead.query.filter(func.regexp_replace(Lead.phone, r"[^0-9]+", "", "g") == norm).first()
-        if email: dup = dup or Lead.query.filter(func.lower(Lead.email) == email).first()
-        if dup: return jsonify({"error": f"Possible duplicate lead: {dup.full_name} (Lead #{dup.id}).", "duplicate_id": dup.id}), 409
-        lead = Lead(ambassador_id=user.id, full_name=name[:120], phone=phone[:40], email=email, city=str(d.get("city", "")).strip() or None,
-                    institution=str(d.get("institution", "")).strip() or None, program_interest=str(d.get("program_interest", "")).strip() or None,
-                    source=str(d.get("source", "")).strip() or None, notes=str(d.get("notes", "")).strip() or None,
-                    priority=d.get("priority") if d.get("priority") in PRIORITY else "medium", next_follow_up_at=parse_dt(d.get("next_follow_up_at")))
-        db.session.add(lead); db.session.flush(); db.session.add(LeadActivity(lead_id=lead.id, user_id=user.id, activity_type="system", note="Lead submitted for admin review."))
-        audit(user.id, "lead_created", "lead", lead.id, f"Submitted {lead.full_name}")
-        admins = User.query.filter_by(role="admin", account_status="active").all()
-        for admin in admins: notify(admin.id, "New lead submitted", f"{lead.full_name} was submitted by {user.full_name}.", "info", "lead", lead.id)
-        db.session.commit(); return jsonify({"message": "Lead submitted for admin review.", "lead": lead.to_dict()}), 201
+
+        dup = Lead.query.filter(
+            func.regexp_replace(
+                Lead.phone,
+                r"[^0-9]+",
+                "",
+                "g"
+            ) == norm
+        ).first()
+
+        if email:
+            dup = (
+                dup
+                or Lead.query.filter(
+                    func.lower(Lead.email) == email
+                ).first()
+            )
+
+        if dup:
+            return jsonify({
+                "error": (
+                    f"Possible duplicate lead: "
+                    f"{dup.full_name} (Lead #{dup.id})."
+                ),
+                "duplicate_id": dup.id
+            }), 409
+
+        lead = Lead(
+            ambassador_id=user.id,
+            full_name=name[:120],
+            phone=phone[:40],
+            email=email,
+            city=str(
+                d.get("city", "")
+            ).strip() or None,
+            institution=str(
+                d.get("institution", "")
+            ).strip() or None,
+            program_interest=str(
+                d.get("program_interest", "")
+            ).strip() or None,
+            source=str(
+                d.get("source", "")
+            ).strip() or None,
+            notes=str(
+                d.get("notes", "")
+            ).strip() or None,
+            priority=(
+                d.get("priority")
+                if d.get("priority") in PRIORITY
+                else "medium"
+            ),
+            next_follow_up_at=parse_dt(
+                d.get("next_follow_up_at")
+            )
+        )
+
+        db.session.add(lead)
+        db.session.flush()
+
+        db.session.add(
+            LeadActivity(
+                lead_id=lead.id,
+                user_id=user.id,
+                activity_type="system",
+                note="Lead submitted for admin review."
+            )
+        )
+
+        audit(
+            user.id,
+            "lead_created",
+            "lead",
+            lead.id,
+            f"Submitted {lead.full_name}"
+        )
+
+        admins = User.query.filter_by(
+            role="admin",
+            account_status="active"
+        ).all()
+
+        for admin in admins:
+            notify(
+                admin.id,
+                "New lead submitted",
+                f"{lead.full_name} was submitted by {user.full_name}.",
+                "info",
+                "lead",
+                lead.id
+            )
+
+        db.session.commit()
+
+        return jsonify({
+            "message": "Lead submitted for admin review.",
+            "lead": lead.to_dict()
+        }), 201
 
     @app.get("/api/leads/<int:lead_id>")
     @require_user("admin", "ambassador")
     def get_lead(user, lead_id):
-        lead = db.session.get(Lead, lead_id)
-        if not lead or not visible_lead(user, lead): return jsonify({"error": "Lead not found."}), 404
-        return jsonify({"lead": lead.to_dict(), "activities": [a.to_dict() for a in lead.activities], "tasks": [t.to_dict() for t in lead.tasks]})
+        lead = db.session.get(
+            Lead,
+            lead_id
+        )
+
+        if not lead or not visible_lead(user, lead):
+            return jsonify({
+                "error": "Lead not found."
+            }), 404
+
+        return jsonify({
+            "lead": lead.to_dict(),
+            "activities": [
+                a.to_dict()
+                for a in lead.activities
+            ],
+            "tasks": [
+                t.to_dict()
+                for t in lead.tasks
+            ]
+        })
 
     @app.post("/api/leads/<int:lead_id>/activities")
     @require_user("admin", "ambassador")
     def add_activity(user, lead_id):
-        lead = db.session.get(Lead, lead_id)
-        if not lead or not visible_lead(user, lead): return jsonify({"error": "Lead not found."}), 404
-        d = request.get_json(silent=True) or {}; typ, note = str(d.get("activity_type", "note")), str(d.get("note", "")).strip()
-        if typ not in ACTIVITY or not note: return jsonify({"error": "Valid activity type and note are required."}), 400
-        a = LeadActivity(lead_id=lead.id, user_id=user.id, activity_type=typ, note=note[:5000]); db.session.add(a)
-        if typ in {"call", "meeting", "email"}: lead.last_contacted_at = now()
-        audit(user.id, "lead_activity_added", "lead", lead.id, f"{typ}: {note[:250]}"); db.session.commit()
-        return jsonify({"message": "Activity added.", "activity": a.to_dict()})
+        lead = db.session.get(
+            Lead,
+            lead_id
+        )
+
+        if not lead or not visible_lead(user, lead):
+            return jsonify({
+                "error": "Lead not found."
+            }), 404
+
+        d = request.get_json(silent=True) or {}
+
+        typ = str(
+            d.get(
+                "activity_type",
+                "note"
+            )
+        )
+
+        note = str(
+            d.get("note", "")
+        ).strip()
+
+        if typ not in ACTIVITY or not note:
+            return jsonify({
+                "error": "Valid activity type and note are required."
+            }), 400
+
+        a = LeadActivity(
+            lead_id=lead.id,
+            user_id=user.id,
+            activity_type=typ,
+            note=note[:5000]
+        )
+
+        db.session.add(a)
+
+        if typ in {
+            "call",
+            "meeting",
+            "email"
+        }:
+            lead.last_contacted_at = now()
+
+        audit(
+            user.id,
+            "lead_activity_added",
+            "lead",
+            lead.id,
+            f"{typ}: {note[:250]}"
+        )
+
+        db.session.commit()
+
+        return jsonify({
+            "message": "Activity added.",
+            "activity": a.to_dict()
+        })
 
     @app.patch("/api/leads/<int:lead_id>")
     @require_user("admin", "ambassador")
     def update_lead(user, lead_id):
-        lead = db.session.get(Lead, lead_id)
-        if not lead or not visible_lead(user, lead): return jsonify({"error": "Lead not found."}), 404
-        d = request.get_json(silent=True) or {}; changes=[]
+        lead = db.session.get(
+            Lead,
+            lead_id
+        )
+
+        if not lead or not visible_lead(user, lead):
+            return jsonify({
+                "error": "Lead not found."
+            }), 404
+
+        d = request.get_json(silent=True) or {}
+        changes = []
+
         if user.role == "admin":
-            if "status" in d and d["status"] in PIPELINE and d["status"] != lead.status: changes.append(f"Status {lead.status} → {d['status']}"); lead.status=d["status"]
-            if "approval_status" in d and d["approval_status"] in APPROVAL and d["approval_status"] != lead.approval_status:
-                old=lead.approval_status; lead.approval_status=d["approval_status"]; changes.append(f"Review {old} → {lead.approval_status}")
-                if lead.approval_status == "accepted": lead.rejection_reason=None; lead.status = "new"
-                if lead.approval_status == "rejected": lead.rejection_reason=str(d.get("rejection_reason", "")).strip()[:500] or "Rejected by administrator"
-            if "priority" in d and d["priority"] in PRIORITY and d["priority"] != lead.priority: changes.append(f"Priority {lead.priority} → {d['priority']}"); lead.priority=d["priority"]
+            if (
+                "status" in d
+                and d["status"] in PIPELINE
+                and d["status"] != lead.status
+            ):
+                changes.append(
+                    f"Status {lead.status} → {d['status']}"
+                )
+
+                lead.status = d["status"]
+
+            if (
+                "approval_status" in d
+                and d["approval_status"] in APPROVAL
+                and d["approval_status"] != lead.approval_status
+            ):
+                old = lead.approval_status
+
+                lead.approval_status = d[
+                    "approval_status"
+                ]
+
+                changes.append(
+                    f"Review {old} → {lead.approval_status}"
+                )
+
+                if lead.approval_status == "accepted":
+                    lead.rejection_reason = None
+                    lead.status = "new"
+
+                if lead.approval_status == "rejected":
+                    lead.rejection_reason = (
+                        str(
+                            d.get(
+                                "rejection_reason",
+                                ""
+                            )
+                        ).strip()[:500]
+                        or "Rejected by administrator"
+                    )
+
+            if (
+                "priority" in d
+                and d["priority"] in PRIORITY
+                and d["priority"] != lead.priority
+            ):
+                changes.append(
+                    f"Priority {lead.priority} → {d['priority']}"
+                )
+
+                lead.priority = d["priority"]
+
             if "ambassador_id" in d:
-                try: new_id=int(d["ambassador_id"])
-                except (TypeError,ValueError): return jsonify({"error":"Invalid assignee."}),400
-                assignee=db.session.get(User,new_id)
-                if not assignee or assignee.role!="ambassador" or assignee.account_status!="active": return jsonify({"error":"Assignee is unavailable."}),400
+                try:
+                    new_id = int(
+                        d["ambassador_id"]
+                    )
+                except (
+                    TypeError,
+                    ValueError
+                ):
+                    return jsonify({
+                        "error": "Invalid assignee."
+                    }), 400
+
+                assignee = db.session.get(
+                    User,
+                    new_id
+                )
+
+                if (
+                    not assignee
+                    or assignee.role != "ambassador"
+                    or assignee.account_status != "active"
+                ):
+                    return jsonify({
+                        "error": "Assignee is unavailable."
+                    }), 400
+
                 if lead.ambassador_id != new_id:
-                    old_name=lead.ambassador.full_name if lead.ambassador else "Unknown"; lead.ambassador_id=new_id
-                    changes.append(f"Assigned {old_name} → {assignee.full_name}")
-                    db.session.add(LeadActivity(lead_id=lead.id,user_id=user.id,activity_type="assignment",note=changes[-1]))
-                    notify(assignee.id,"Lead assigned",f"Lead #{lead.id} — {lead.full_name} was assigned to you.","info","lead",lead.id)
-        for field in ["full_name","email","phone","city","institution","program_interest","source","notes"]:
-            if field in d: setattr(lead, field, str(d[field]).strip() if d[field] is not None else None)
-        if "next_follow_up_at" in d: lead.next_follow_up_at=parse_dt(d.get("next_follow_up_at"))
-        if user.role=="admin" and "last_contacted_at" in d: lead.last_contacted_at=parse_dt(d.get("last_contacted_at"))
-        if not lead.full_name or not lead.phone: return jsonify({"error":"Lead name and phone are required."}),400
+                    old_name = (
+                        lead.ambassador.full_name
+                        if lead.ambassador
+                        else "Unknown"
+                    )
+
+                    lead.ambassador_id = new_id
+
+                    changes.append(
+                        f"Assigned {old_name} → {assignee.full_name}"
+                    )
+
+                    db.session.add(
+                        LeadActivity(
+                            lead_id=lead.id,
+                            user_id=user.id,
+                            activity_type="assignment",
+                            note=changes[-1]
+                        )
+                    )
+
+                    notify(
+                        assignee.id,
+                        "Lead assigned",
+                        f"Lead #{lead.id} — {lead.full_name} was assigned to you.",
+                        "info",
+                        "lead",
+                        lead.id
+                    )
+
+        for field in [
+            "full_name",
+            "email",
+            "phone",
+            "city",
+            "institution",
+            "program_interest",
+            "source",
+            "notes"
+        ]:
+            if field in d:
+                setattr(
+                    lead,
+                    field,
+                    (
+                        str(d[field]).strip()
+                        if d[field] is not None
+                        else None
+                    )
+                )
+
+        if "next_follow_up_at" in d:
+            lead.next_follow_up_at = parse_dt(
+                d.get("next_follow_up_at")
+            )
+
+        if (
+            user.role == "admin"
+            and "last_contacted_at" in d
+        ):
+            lead.last_contacted_at = parse_dt(
+                d.get("last_contacted_at")
+            )
+
+        if not lead.full_name or not lead.phone:
+            return jsonify({
+                "error": "Lead name and phone are required."
+            }), 400
+
         if changes:
-            for c in changes: db.session.add(LeadActivity(lead_id=lead.id,user_id=user.id,activity_type="status_change",note=c))
-            audit(user.id,"lead_updated","lead",lead.id,"; ".join(changes))
-            if lead.ambassador and lead.ambassador_id != user.id: notify(lead.ambassador_id,"Lead updated",f"Lead #{lead.id} was updated by an administrator.","info","lead",lead.id)
-        db.session.commit(); return jsonify({"message":"Lead updated.","lead":lead.to_dict()})
+            for c in changes:
+                db.session.add(
+                    LeadActivity(
+                        lead_id=lead.id,
+                        user_id=user.id,
+                        activity_type="status_change",
+                        note=c
+                    )
+                )
+
+            audit(
+                user.id,
+                "lead_updated",
+                "lead",
+                lead.id,
+                "; ".join(changes)
+            )
+
+            if (
+                lead.ambassador
+                and lead.ambassador_id != user.id
+            ):
+                notify(
+                    lead.ambassador_id,
+                    "Lead updated",
+                    f"Lead #{lead.id} was updated by an administrator.",
+                    "info",
+                    "lead",
+                    lead.id
+                )
+
+        db.session.commit()
+
+        return jsonify({
+            "message": "Lead updated.",
+            "lead": lead.to_dict()
+        })
 
     @app.delete("/api/leads/<int:lead_id>")
     @require_user("admin")
     def delete_lead(user, lead_id):
-        lead=db.session.get(Lead,lead_id)
-        if not lead:return jsonify({"error":"Lead not found."}),404
-        audit(user.id,"lead_deleted","lead",lead.id,f"Deleted lead {lead.full_name} (#{lead.id})");db.session.delete(lead);db.session.commit()
-        return jsonify({"message":"Lead deleted."})
+        lead = db.session.get(
+            Lead,
+            lead_id
+        )
+
+        if not lead:
+            return jsonify({
+                "error": "Lead not found."
+            }), 404
+
+        audit(
+            user.id,
+            "lead_deleted",
+            "lead",
+            lead.id,
+            f"Deleted lead {lead.full_name} (#{lead.id})"
+        )
+
+        db.session.delete(lead)
+        db.session.commit()
+
+        return jsonify({
+            "message": "Lead deleted."
+        })
 
     @app.post("/api/admin/leads/bulk")
     @require_user("admin")
     def bulk_leads(user):
-        d=request.get_json(silent=True) or {}; ids=d.get("lead_ids") or []; action=d.get("action")
-        if not ids or action not in {"delete","accept","reject","status","priority","assign"}: return jsonify({"error":"Invalid bulk action."}),400
-        affected=[]
+        d = request.get_json(silent=True) or {}
+
+        ids = d.get("lead_ids") or []
+        action = d.get("action")
+
+        if (
+            not ids
+            or action not in {
+                "delete",
+                "accept",
+                "reject",
+                "status",
+                "priority",
+                "assign"
+            }
+        ):
+            return jsonify({
+                "error": "Invalid bulk action."
+            }), 400
+
+        affected = []
+
         for raw in ids:
-            try: lead=db.session.get(Lead,int(raw))
-            except (TypeError,ValueError): lead=None
-            if not lead: continue
-            if action=="delete": audit(user.id,"lead_deleted","lead",lead.id,"Bulk deletion");db.session.delete(lead)
-            elif action=="accept": lead.approval_status="accepted";lead.rejection_reason=None;lead.status="new"
-            elif action=="reject": lead.approval_status="rejected";lead.rejection_reason=str(d.get("reason","Rejected in bulk"))[:500]
-            elif action=="status" and d.get("status") in PIPELINE: lead.status=d["status"]
-            elif action=="priority" and d.get("priority") in PRIORITY: lead.priority=d["priority"]
-            elif action=="assign":
-                assignee=db.session.get(User,int(d.get("ambassador_id",0)))
-                if not assignee or assignee.role!="ambassador" or assignee.account_status!="active": return jsonify({"error":"Invalid assignee."}),400
-                lead.ambassador_id=assignee.id;notify(assignee.id,"Leads assigned",f"Lead #{lead.id} was assigned to you.","info","lead",lead.id)
+            try:
+                lead = db.session.get(
+                    Lead,
+                    int(raw)
+                )
+            except (
+                TypeError,
+                ValueError
+            ):
+                lead = None
+
+            if not lead:
+                continue
+
+            if action == "delete":
+                audit(
+                    user.id,
+                    "lead_deleted",
+                    "lead",
+                    lead.id,
+                    "Bulk deletion"
+                )
+
+                db.session.delete(lead)
+
+            elif action == "accept":
+                lead.approval_status = "accepted"
+                lead.rejection_reason = None
+                lead.status = "new"
+
+            elif action == "reject":
+                lead.approval_status = "rejected"
+                lead.rejection_reason = str(
+                    d.get(
+                        "reason",
+                        "Rejected in bulk"
+                    )
+                )[:500]
+
+            elif (
+                action == "status"
+                and d.get("status") in PIPELINE
+            ):
+                lead.status = d["status"]
+
+            elif (
+                action == "priority"
+                and d.get("priority") in PRIORITY
+            ):
+                lead.priority = d["priority"]
+
+            elif action == "assign":
+                assignee = db.session.get(
+                    User,
+                    int(
+                        d.get(
+                            "ambassador_id",
+                            0
+                        )
+                    )
+                )
+
+                if (
+                    not assignee
+                    or assignee.role != "ambassador"
+                    or assignee.account_status != "active"
+                ):
+                    return jsonify({
+                        "error": "Invalid assignee."
+                    }), 400
+
+                lead.ambassador_id = assignee.id
+
+                notify(
+                    assignee.id,
+                    "Leads assigned",
+                    f"Lead #{lead.id} was assigned to you.",
+                    "info",
+                    "lead",
+                    lead.id
+                )
+
             affected.append(lead.id)
-        audit(user.id,"bulk_lead_action","lead",None,f"Action {action} on {len(affected)} leads");db.session.commit();return jsonify({"message":f"Bulk action applied to {len(affected)} leads.","affected":affected})
+
+        audit(
+            user.id,
+            "bulk_lead_action",
+            "lead",
+            None,
+            f"Action {action} on {len(affected)} leads"
+        )
+
+        db.session.commit()
+
+        return jsonify({
+            "message": (
+                f"Bulk action applied to "
+                f"{len(affected)} leads."
+            ),
+            "affected": affected
+        })
 
     @app.post("/api/leads/<int:lead_id>/tasks")
     @require_user("admin", "ambassador")
     def add_task(user, lead_id):
-        lead=db.session.get(Lead,lead_id)
-        if not lead or not visible_lead(user,lead):return jsonify({"error":"Lead not found."}),404
-        d=request.get_json(silent=True) or {}; title=str(d.get("title","New follow-up")).strip(); due=parse_dt(d.get("due_at"))
-        if not title or not due:return jsonify({"error":"Task title and due date are required."}),400
-        assignee_id=user.id
-        if user.role=="admin" and d.get("assignee_id"):
-            try: assignee_id=int(d["assignee_id"])
-            except ValueError:return jsonify({"error":"Invalid assignee."}),400
-            assignee=db.session.get(User,assignee_id)
-            if not assignee or assignee.role!="ambassador" or assignee.account_status!="active":return jsonify({"error":"Invalid assignee."}),400
-        task=Task(lead_id=lead.id,assignee_id=assignee_id,title=title[:200],due_at=due,priority=d.get("priority") if d.get("priority") in PRIORITY else "medium",notes=str(d.get("notes","")).strip() or None)
-        db.session.add(task);audit(user.id,"task_created","task",None,f"Follow-up for lead #{lead.id}");db.session.commit();return jsonify({"task":task.to_dict()}),201
+        lead = db.session.get(
+            Lead,
+            lead_id
+        )
+
+        if not lead or not visible_lead(user, lead):
+            return jsonify({
+                "error": "Lead not found."
+            }), 404
+
+        d = request.get_json(silent=True) or {}
+
+        title = str(
+            d.get(
+                "title",
+                "New follow-up"
+            )
+        ).strip()
+
+        due = parse_dt(
+            d.get("due_at")
+        )
+
+        if not title or not due:
+            return jsonify({
+                "error": "Task title and due date are required."
+            }), 400
+
+        assignee_id = user.id
+
+        if user.role == "admin" and d.get("assignee_id"):
+            try:
+                assignee_id = int(
+                    d["assignee_id"]
+                )
+            except ValueError:
+                return jsonify({
+                    "error": "Invalid assignee."
+                }), 400
+
+            assignee = db.session.get(
+                User,
+                assignee_id
+            )
+
+            if (
+                not assignee
+                or assignee.role != "ambassador"
+                or assignee.account_status != "active"
+            ):
+                return jsonify({
+                    "error": "Invalid assignee."
+                }), 400
+
+        task = Task(
+            lead_id=lead.id,
+            assignee_id=assignee_id,
+            title=title[:200],
+            due_at=due,
+            priority=(
+                d.get("priority")
+                if d.get("priority") in PRIORITY
+                else "medium"
+            ),
+            notes=str(
+                d.get("notes", "")
+            ).strip() or None
+        )
+
+        db.session.add(task)
+
+        audit(
+            user.id,
+            "task_created",
+            "task",
+            None,
+            f"Follow-up for lead #{lead.id}"
+        )
+
+        db.session.commit()
+
+        return jsonify({
+            "task": task.to_dict()
+        }), 201
 
     @app.patch("/api/tasks/<int:task_id>")
     @require_user("admin", "ambassador")
     def update_task(user, task_id):
-        task=db.session.get(Task,task_id)
-        if not task or (user.role!="admin" and task.assignee_id!=user.id and task.lead.ambassador_id!=user.id):return jsonify({"error":"Task not found."}),404
-        d=request.get_json(silent=True) or {}
-        if "completed" in d: task.completed_at=now() if d["completed"] else None
-        if "title" in d: task.title=str(d["title"]).strip()[:200]
+        task = db.session.get(
+            Task,
+            task_id
+        )
+
+        if (
+            not task
+            or (
+                user.role != "admin"
+                and task.assignee_id != user.id
+                and task.lead.ambassador_id != user.id
+            )
+        ):
+            return jsonify({
+                "error": "Task not found."
+            }), 404
+
+        d = request.get_json(silent=True) or {}
+
+        if "completed" in d:
+            task.completed_at = (
+                now()
+                if d["completed"]
+                else None
+            )
+
+        if "title" in d:
+            task.title = str(
+                d["title"]
+            ).strip()[:200]
+
         if "due_at" in d:
-            dt=parse_dt(d["due_at"])
-            if not dt: return jsonify({"error":"Invalid due date."}),400
-            task.due_at=dt
-        if "priority" in d and d["priority"] in PRIORITY:task.priority=d["priority"]
-        db.session.commit();return jsonify({"task":task.to_dict()})
+            dt = parse_dt(
+                d["due_at"]
+            )
+
+            if not dt:
+                return jsonify({
+                    "error": "Invalid due date."
+                }), 400
+
+            task.due_at = dt
+
+        if (
+            "priority" in d
+            and d["priority"] in PRIORITY
+        ):
+            task.priority = d["priority"]
+
+        db.session.commit()
+
+        return jsonify({
+            "task": task.to_dict()
+        })
 
     @app.get("/api/tasks")
     @require_user("admin", "ambassador")
     def list_tasks(user):
-        q=Task.query if user.role=="admin" else Task.query.filter_by(assignee_id=user.id)
-        if request.args.get("completed") in {"true","false"}: q=q.filter(Task.completed_at.is_not(None) if request.args.get("completed")=="true" else Task.completed_at.is_(None))
-        rows,meta=paginated(q.order_by(Task.due_at.asc()))
-        return jsonify({"tasks":[x.to_dict() for x in rows],"pagination":meta})
+        q = (
+            Task.query
+            if user.role == "admin"
+            else Task.query.filter_by(
+                assignee_id=user.id
+            )
+        )
+
+        if request.args.get(
+            "completed"
+        ) in {"true", "false"}:
+            if request.args.get(
+                "completed"
+            ) == "true":
+                q = q.filter(
+                    Task.completed_at.is_not(None)
+                )
+            else:
+                q = q.filter(
+                    Task.completed_at.is_(None)
+                )
+
+        rows, meta = paginated(
+            q.order_by(
+                Task.due_at.asc()
+            )
+        )
+
+        return jsonify({
+            "tasks": [
+                x.to_dict()
+                for x in rows
+            ],
+            "pagination": meta
+        })
 
     @app.get("/api/notifications")
     @require_user("admin", "ambassador")
     def notifications(user):
-        q=Notification.query.filter_by(user_id=user.id); unread=q.filter_by(is_read=False).count(); rows,meta=paginated(q.order_by(Notification.created_at.desc()),20,50)
-        return jsonify({"notifications":[x.to_dict() for x in rows],"unread":unread,"pagination":meta})
+        q = Notification.query.filter_by(
+            user_id=user.id
+        )
+
+        unread = q.filter_by(
+            is_read=False
+        ).count()
+
+        rows, meta = paginated(
+            q.order_by(
+                Notification.created_at.desc()
+            ),
+            20,
+            50
+        )
+
+        return jsonify({
+            "notifications": [
+                x.to_dict()
+                for x in rows
+            ],
+            "unread": unread,
+            "pagination": meta
+        })
 
     @app.patch("/api/notifications/<int:notification_id>/read")
     @require_user("admin", "ambassador")
-    def mark_notification(user, notification_id):
-        n=db.session.get(Notification,notification_id)
-        if not n or n.user_id!=user.id:return jsonify({"error":"Notification not found."}),404
-        n.is_read=True;db.session.commit();return jsonify({"message":"Marked as read."})
+    def mark_notification(
+        user,
+        notification_id
+    ):
+        n = db.session.get(
+            Notification,
+            notification_id
+        )
+
+        if not n or n.user_id != user.id:
+            return jsonify({
+                "error": "Notification not found."
+            }), 404
+
+        n.is_read = True
+
+        db.session.commit()
+
+        return jsonify({
+            "message": "Marked as read."
+        })
 
     @app.post("/api/notifications/read-all")
     @require_user("admin", "ambassador")
     def mark_all_notifications(user):
-        Notification.query.filter_by(user_id=user.id,is_read=False).update({"is_read":True});db.session.commit();return jsonify({"message":"Notifications cleared."})
+        Notification.query.filter_by(
+            user_id=user.id,
+            is_read=False
+        ).update({
+            "is_read": True
+        })
+
+        db.session.commit()
+
+        return jsonify({
+            "message": "Notifications cleared."
+        })
 
     @app.get("/api/admin/users")
     @require_user("admin")
     def admin_users(user):
-        q=User.query.filter(User.role=="ambassador")
-        search=request.args.get("search","").strip()
-        if search:q=q.filter(or_(User.full_name.ilike(f"%{search}%"),User.email.ilike(f"%{search}%"),User.phone.ilike(f"%{search}%")))
-        if request.args.get("status") in {"active","pending","blocked"}:q=q.filter(User.account_status==request.args["status"])
-        rows,meta=paginated(q.order_by(User.created_at.desc()))
-        return jsonify({"users":[x.to_dict() for x in rows],"pagination":meta})
+        q = User.query.filter(
+            User.role == "ambassador"
+        )
+
+        search = request.args.get(
+            "search",
+            ""
+        ).strip()
+
+        if search:
+            q = q.filter(
+                or_(
+                    User.full_name.ilike(
+                        f"%{search}%"
+                    ),
+                    User.email.ilike(
+                        f"%{search}%"
+                    ),
+                    User.phone.ilike(
+                        f"%{search}%"
+                    )
+                )
+            )
+
+        if request.args.get(
+            "status"
+        ) in {
+            "active",
+            "pending",
+            "blocked"
+        }:
+            q = q.filter(
+                User.account_status
+                == request.args["status"]
+            )
+
+        rows, meta = paginated(
+            q.order_by(
+                User.created_at.desc()
+            )
+        )
+
+        return jsonify({
+            "users": [
+                x.to_dict()
+                for x in rows
+            ],
+            "pagination": meta
+        })
 
     @app.patch("/api/admin/users/<int:user_id>")
     @require_user("admin")
     def update_user(user, user_id):
-        target=db.session.get(User,user_id)
-        if not target or target.role!="ambassador":return jsonify({"error":"Employee not found."}),404
-        d=request.get_json(silent=True) or {};status=d.get("account_status")
-        if status not in {"active","pending","blocked"}:return jsonify({"error":"Invalid account status."}),400
-        target.account_status=status;target.is_active=(status == "active");target.full_name=str(d.get("full_name",target.full_name)).strip()[:120];target.phone=str(d.get("phone",target.phone or "")).strip() or None
-        audit(user.id,"employee_status_changed","user",target.id,f"Employee set to {status}")
-        if status=="active":notify(target.id,"Account activated","Your WireFizz LMS account is active.","success")
-        if status=="blocked":notify(target.id,"Account blocked","Your WireFizz LMS account has been blocked by an administrator.","warning")
-        db.session.commit();return jsonify({"user":target.to_dict()})
+        target = db.session.get(
+            User,
+            user_id
+        )
+
+        if not target or target.role != "ambassador":
+            return jsonify({
+                "error": "Employee not found."
+            }), 404
+
+        d = request.get_json(silent=True) or {}
+
+        status = d.get(
+            "account_status"
+        )
+
+        if status not in {
+            "active",
+            "pending",
+            "blocked"
+        }:
+            return jsonify({
+                "error": "Invalid account status."
+            }), 400
+
+        target.account_status = status
+        target.is_active = (
+            status == "active"
+        )
+
+        target.full_name = str(
+            d.get(
+                "full_name",
+                target.full_name
+            )
+        ).strip()[:120]
+
+        target.phone = (
+            str(
+                d.get(
+                    "phone",
+                    target.phone or ""
+                )
+            ).strip()
+            or None
+        )
+
+        audit(
+            user.id,
+            "employee_status_changed",
+            "user",
+            target.id,
+            f"Employee set to {status}"
+        )
+
+        if status == "active":
+            notify(
+                target.id,
+                "Account activated",
+                "Your WireFizz LMS account is active.",
+                "success"
+            )
+
+        if status == "blocked":
+            notify(
+                target.id,
+                "Account blocked",
+                "Your WireFizz LMS account has been blocked by an administrator.",
+                "warning"
+            )
+
+        db.session.commit()
+
+        return jsonify({
+            "user": target.to_dict()
+        })
 
     @app.delete("/api/admin/users/<int:user_id>")
     @require_user("admin")
-    def delete_user(user,user_id):
-        target=db.session.get(User,user_id)
-        if not target or target.role!="ambassador":return jsonify({"error":"Employee not found."}),404
-        audit(user.id,"employee_deleted","user",target.id,f"Deleted employee {target.full_name} and related data")
-        db.session.delete(target);db.session.commit();return jsonify({"message":"Employee deleted."})
+    def delete_user(user, user_id):
+        target = db.session.get(
+            User,
+            user_id
+        )
+
+        if not target or target.role != "ambassador":
+            return jsonify({
+                "error": "Employee not found."
+            }), 404
+
+        audit(
+            user.id,
+            "employee_deleted",
+            "user",
+            target.id,
+            f"Deleted employee {target.full_name} and related data"
+        )
+
+        db.session.delete(target)
+        db.session.commit()
+
+        return jsonify({
+            "message": "Employee deleted."
+        })
 
     @app.post("/api/admin/users")
     @require_user("admin")
     def create_employee(user):
-        d=request.get_json(silent=True) or {};name=str(d.get("full_name","")).strip();email=str(d.get("email","")).strip().lower();pwd=d.get("password","")
-        if not name or not email or len(pwd)<8:return jsonify({"error":"Name, email and password (8+ chars) are required."}),400
-        try:validate_email(email)
-        except EmailNotValidError:return jsonify({"error":"Invalid email."}),400
-        if User.query.filter(func.lower(User.email)==email).first():return jsonify({"error":"Email already exists."}),409
-        emp=User(full_name=name,email=email,phone=str(d.get("phone","")).strip() or None,role="ambassador",account_status="active");emp.set_password(pwd);db.session.add(emp);db.session.flush()
-        audit(user.id,"employee_created","user",emp.id,f"Created employee {emp.full_name}");db.session.commit();return jsonify({"user":emp.to_dict()}),201
+        d = request.get_json(silent=True) or {}
+
+        name = str(
+            d.get(
+                "full_name",
+                ""
+            )
+        ).strip()
+
+        email = str(
+            d.get(
+                "email",
+                ""
+            )
+        ).strip().lower()
+
+        pwd = d.get(
+            "password",
+            ""
+        )
+
+        if (
+            not name
+            or not email
+            or len(pwd) < 8
+        ):
+            return jsonify({
+                "error": "Name, email and password (8+ chars) are required."
+            }), 400
+
+        try:
+            validate_email(email)
+        except EmailNotValidError:
+            return jsonify({
+                "error": "Invalid email."
+            }), 400
+
+        if User.query.filter(
+            func.lower(User.email) == email
+        ).first():
+            return jsonify({
+                "error": "Email already exists."
+            }), 409
+
+        emp = User(
+            full_name=name,
+            email=email,
+            phone=str(
+                d.get(
+                    "phone",
+                    ""
+                )
+            ).strip() or None,
+            role="ambassador",
+            account_status="active"
+        )
+
+        emp.set_password(pwd)
+
+        db.session.add(emp)
+        db.session.flush()
+
+        audit(
+            user.id,
+            "employee_created",
+            "user",
+            emp.id,
+            f"Created employee {emp.full_name}"
+        )
+
+        db.session.commit()
+
+        return jsonify({
+            "user": emp.to_dict()
+        }), 201
 
     @app.get("/api/admin/audit-logs")
     @require_user("admin")
     def audit_logs(user):
-        q=AuditLog.query
-        action=request.args.get("action");search=request.args.get("search","").strip()
-        if action:q=q.filter(AuditLog.action==action)
-        if search:q=q.filter(AuditLog.details.ilike(f"%{search}%"))
-        rows,meta=paginated(q.order_by(AuditLog.created_at.desc()),30,100)
-        return jsonify({"logs":[x.to_dict() for x in rows],"pagination":meta})
+        q = AuditLog.query
+
+        action = request.args.get(
+            "action"
+        )
+
+        search = request.args.get(
+            "search",
+            ""
+        ).strip()
+
+        if action:
+            q = q.filter(
+                AuditLog.action == action
+            )
+
+        if search:
+            q = q.filter(
+                AuditLog.details.ilike(
+                    f"%{search}%"
+                )
+            )
+
+        rows, meta = paginated(
+            q.order_by(
+                AuditLog.created_at.desc()
+            ),
+            30,
+            100
+        )
+
+        return jsonify({
+            "logs": [
+                x.to_dict()
+                for x in rows
+            ],
+            "pagination": meta
+        })
 
     @app.get("/api/performance")
     @require_user("ambassador")
     def performance(user):
-        q=Lead.query.filter_by(ambassador_id=user.id)
-        total=q.count();accepted=q.filter_by(approval_status="accepted").count();converted=q.filter_by(status="converted").count()
-        pipeline=[{"status":st,"count":q.filter_by(status=st).count()} for st in ["new","contacted","qualified","follow_up","converted"]]
-        recent=q.order_by(Lead.created_at.desc()).limit(8).all()
-        return jsonify({"leads":total,"accepted":accepted,"converted":converted,"pending":q.filter_by(approval_status="pending").count(),"rejected":q.filter_by(approval_status="rejected").count(),"due_followups":q.filter(Lead.next_follow_up_at<=now(),Lead.next_follow_up_at.is_not(None)).count(),"conversion_rate":round(converted/accepted*100,1) if accepted else 0,"pipeline":pipeline,"recent":[x.to_dict() for x in recent]})
+        q = Lead.query.filter_by(
+            ambassador_id=user.id
+        )
+
+        total = q.count()
+        accepted = q.filter_by(
+            approval_status="accepted"
+        ).count()
+
+        converted = q.filter_by(
+            status="converted"
+        ).count()
+
+        pipeline = [
+            {
+                "status": st,
+                "count": q.filter_by(
+                    status=st
+                ).count()
+            }
+            for st in [
+                "new",
+                "contacted",
+                "qualified",
+                "follow_up",
+                "converted"
+            ]
+        ]
+
+        recent = q.order_by(
+            Lead.created_at.desc()
+        ).limit(8).all()
+
+        return jsonify({
+            "leads": total,
+            "accepted": accepted,
+            "converted": converted,
+            "pending": q.filter_by(
+                approval_status="pending"
+            ).count(),
+            "rejected": q.filter_by(
+                approval_status="rejected"
+            ).count(),
+            "due_followups": q.filter(
+                Lead.next_follow_up_at <= now(),
+                Lead.next_follow_up_at.is_not(None)
+            ).count(),
+            "conversion_rate": (
+                round(
+                    converted / accepted * 100,
+                    1
+                )
+                if accepted
+                else 0
+            ),
+            "pipeline": pipeline,
+            "recent": [
+                x.to_dict()
+                for x in recent
+            ]
+        })
 
     @app.get("/api/admin/analytics")
     @require_user("admin")
     def analytics(user):
-        end=datetime.now(timezone.utc).date();start=end-timedelta(days=29)
+        end = datetime.now(
+            timezone.utc
+        ).date()
+
+        start = end - timedelta(
+            days=29
+        )
+
         try:
-            if request.args.get("from"):start=datetime.fromisoformat(request.args["from"]).date()
-            if request.args.get("to"):end=datetime.fromisoformat(request.args["to"]).date()
-        except ValueError:return jsonify({"error":"Dates must use YYYY-MM-DD."}),400
-        if end<start:return jsonify({"error":"Invalid date range."}),400
-        start_dt=datetime.combine(start,datetime.min.time(),tzinfo=timezone.utc);end_dt=datetime.combine(end,datetime.max.time(),tzinfo=timezone.utc)
-        q=Lead.query.filter(Lead.created_at.between(start_dt,end_dt)); total=q.count(); accepted=q.filter_by(approval_status="accepted").count();converted=q.filter_by(status="converted").count()
-        statuses=[{"status":s,"count":q.filter_by(status=s).count()} for s in ["new","contacted","qualified","follow_up","converted"]]
-        sources=db.session.query(Lead.source,func.count(Lead.id)).filter(Lead.created_at.between(start_dt,end_dt)).group_by(Lead.source).order_by(func.count(Lead.id).desc()).all()
-        emp_rows=db.session.query(User.id,User.full_name,User.profile_picture,func.count(Lead.id),func.sum(case((Lead.approval_status=="accepted",1),else_=0)),func.sum(case((Lead.status=="converted",1),else_=0))).join(Lead,Lead.ambassador_id==User.id).filter(User.role=="ambassador",Lead.created_at.between(start_dt,end_dt)).group_by(User.id).order_by(func.count(Lead.id).desc()).all()
-        daily=[];cursor=start
-        while cursor<=end:
-            nxt=cursor+timedelta(days=1);s=datetime.combine(cursor,datetime.min.time(),tzinfo=timezone.utc);e=datetime.combine(nxt,datetime.min.time(),tzinfo=timezone.utc)
-            daily.append({"date":cursor.isoformat(),"count":q.filter(Lead.created_at>=s,Lead.created_at<e).count()});cursor=nxt
-        employees=[{"id":r[0],"name":r[1],"profile_picture":r[2],"leads":int(r[3] or 0),"accepted":int(r[4] or 0),"converted":int(r[5] or 0),"conversion_rate":round((int(r[5] or 0)/int(r[4] or 0))*100,1) if r[4] else 0} for r in emp_rows]
-        return jsonify({"range":{"from":start.isoformat(),"to":end.isoformat()},"summary":{"total":total,"accepted":accepted,"rejected":q.filter_by(approval_status="rejected").count(),"pending":q.filter_by(approval_status="pending").count(),"converted":converted,"qualified":q.filter_by(status="qualified").count(),"high_priority":q.filter_by(priority="high").count(),"conversion_rate":round(converted/accepted*100,1) if accepted else 0},"pipeline":statuses,"sources":[{"source":s or "Unknown","count":int(c)} for s,c in sources],"employees":employees[:50],"daily":daily})
+            if request.args.get("from"):
+                start = datetime.fromisoformat(
+                    request.args["from"]
+                ).date()
+
+            if request.args.get("to"):
+                end = datetime.fromisoformat(
+                    request.args["to"]
+                ).date()
+
+        except ValueError:
+            return jsonify({
+                "error": "Dates must use YYYY-MM-DD."
+            }), 400
+
+        if end < start:
+            return jsonify({
+                "error": "Invalid date range."
+            }), 400
+
+        start_dt = datetime.combine(
+            start,
+            datetime.min.time(),
+            tzinfo=timezone.utc
+        )
+
+        end_dt = datetime.combine(
+            end,
+            datetime.max.time(),
+            tzinfo=timezone.utc
+        )
+
+        q = Lead.query.filter(
+            Lead.created_at.between(
+                start_dt,
+                end_dt
+            )
+        )
+
+        total = q.count()
+
+        accepted = q.filter_by(
+            approval_status="accepted"
+        ).count()
+
+        converted = q.filter_by(
+            status="converted"
+        ).count()
+
+        statuses = [
+            {
+                "status": s,
+                "count": q.filter_by(
+                    status=s
+                ).count()
+            }
+            for s in [
+                "new",
+                "contacted",
+                "qualified",
+                "follow_up",
+                "converted"
+            ]
+        ]
+
+        sources = (
+            db.session.query(
+                Lead.source,
+                func.count(Lead.id)
+            )
+            .filter(
+                Lead.created_at.between(
+                    start_dt,
+                    end_dt
+                )
+            )
+            .group_by(
+                Lead.source
+            )
+            .order_by(
+                func.count(Lead.id).desc()
+            )
+            .all()
+        )
+
+        emp_rows = (
+            db.session.query(
+                User.id,
+                User.full_name,
+                User.profile_picture,
+                func.count(Lead.id),
+                func.sum(
+                    case(
+                        (
+                            Lead.approval_status == "accepted",
+                            1
+                        ),
+                        else_=0
+                    )
+                ),
+                func.sum(
+                    case(
+                        (
+                            Lead.status == "converted",
+                            1
+                        ),
+                        else_=0
+                    )
+                )
+            )
+            .join(
+                Lead,
+                Lead.ambassador_id == User.id
+            )
+            .filter(
+                User.role == "ambassador",
+                Lead.created_at.between(
+                    start_dt,
+                    end_dt
+                )
+            )
+            .group_by(
+                User.id
+            )
+            .order_by(
+                func.count(Lead.id).desc()
+            )
+            .all()
+        )
+
+        daily = []
+        cursor = start
+
+        while cursor <= end:
+            nxt = cursor + timedelta(
+                days=1
+            )
+
+            s = datetime.combine(
+                cursor,
+                datetime.min.time(),
+                tzinfo=timezone.utc
+            )
+
+            e = datetime.combine(
+                nxt,
+                datetime.min.time(),
+                tzinfo=timezone.utc
+            )
+
+            daily.append({
+                "date": cursor.isoformat(),
+                "count": q.filter(
+                    Lead.created_at >= s,
+                    Lead.created_at < e
+                ).count()
+            })
+
+            cursor = nxt
+
+        employees = [
+            {
+                "id": r[0],
+                "name": r[1],
+                "profile_picture": r[2],
+                "leads": int(r[3] or 0),
+                "accepted": int(r[4] or 0),
+                "converted": int(r[5] or 0),
+                "conversion_rate": (
+                    round(
+                        (
+                            int(r[5] or 0)
+                            / int(r[4] or 0)
+                        ) * 100,
+                        1
+                    )
+                    if r[4]
+                    else 0
+                )
+            }
+            for r in emp_rows
+        ]
+
+        return jsonify({
+            "range": {
+                "from": start.isoformat(),
+                "to": end.isoformat()
+            },
+            "summary": {
+                "total": total,
+                "accepted": accepted,
+                "rejected": q.filter_by(
+                    approval_status="rejected"
+                ).count(),
+                "pending": q.filter_by(
+                    approval_status="pending"
+                ).count(),
+                "converted": converted,
+                "qualified": q.filter_by(
+                    status="qualified"
+                ).count(),
+                "high_priority": q.filter_by(
+                    priority="high"
+                ).count(),
+                "conversion_rate": (
+                    round(
+                        converted / accepted * 100,
+                        1
+                    )
+                    if accepted
+                    else 0
+                )
+            },
+            "pipeline": statuses,
+            "sources": [
+                {
+                    "source": s or "Unknown",
+                    "count": int(c)
+                }
+                for s, c in sources
+            ],
+            "employees": employees[:50],
+            "daily": daily
+        })
 
     @app.get("/api/admin/export/leads.csv")
     @require_user("admin")
     def export_csv(user):
-        out=io.StringIO();writer=csv.writer(out);writer.writerow(["ID","Lead","Phone","Email","Employee","Institution","Program","Review","Pipeline","Priority","Next Follow-up","Created"])
-        for x in Lead.query.order_by(Lead.created_at.desc()).all(): writer.writerow([x.id,x.full_name,x.phone,x.email or "",x.ambassador.full_name if x.ambassador else "",x.institution or "",x.program_interest or "",x.approval_status,x.status,x.priority,x.next_follow_up_at.isoformat() if x.next_follow_up_at else "",x.created_at.isoformat()])
-        audit(user.id,"lead_exported",None,None,"CSV lead export");db.session.commit();return Response(out.getvalue(),mimetype="text/csv",headers={"Content-Disposition":"attachment; filename=wirefizz_leads.csv"})
+        out = io.StringIO()
+
+        writer = csv.writer(out)
+
+        writer.writerow([
+            "ID",
+            "Lead",
+            "Phone",
+            "Email",
+            "Employee",
+            "Institution",
+            "Program",
+            "Review",
+            "Pipeline",
+            "Priority",
+            "Next Follow-up",
+            "Created"
+        ])
+
+        for x in Lead.query.order_by(
+            Lead.created_at.desc()
+        ).all():
+            writer.writerow([
+                x.id,
+                x.full_name,
+                x.phone,
+                x.email or "",
+                (
+                    x.ambassador.full_name
+                    if x.ambassador
+                    else ""
+                ),
+                x.institution or "",
+                x.program_interest or "",
+                x.approval_status,
+                x.status,
+                x.priority,
+                (
+                    x.next_follow_up_at.isoformat()
+                    if x.next_follow_up_at
+                    else ""
+                ),
+                x.created_at.isoformat()
+            ])
+
+        audit(
+            user.id,
+            "lead_exported",
+            None,
+            None,
+            "CSV lead export"
+        )
+
+        db.session.commit()
+
+        return Response(
+            out.getvalue(),
+            mimetype="text/csv",
+            headers={
+                "Content-Disposition":
+                    "attachment; filename=wirefizz_leads.csv"
+            }
+        )
 
     @app.post("/api/admin/import/leads")
     @require_user("admin")
     def import_leads(user):
-        f=request.files.get("file")
-        if not f:return jsonify({"error":"CSV file is required."}),400
-        try: textdata=f.read().decode("utf-8-sig")
-        except UnicodeDecodeError:return jsonify({"error":"CSV must be UTF-8 encoded."}),400
-        reader=csv.DictReader(io.StringIO(textdata));required={"full_name","phone"}
-        if not required.issubset({x.strip() for x in (reader.fieldnames or [])}):return jsonify({"error":"CSV must include full_name and phone columns."}),400
-        created=skipped=0;errors=[]
-        for i,row in enumerate(reader, start=2):
-            if i>5002:break
-            name=str(row.get("full_name","")).strip();phone=str(row.get("phone","")).strip();email=str(row.get("email","")).strip().lower() or None
-            if not name or not phone:skipped+=1;errors.append(f"Row {i}: missing name or phone");continue
-            norm=normalize_phone(phone);dup=Lead.query.filter(func.regexp_replace(Lead.phone,r"[^0-9]+","","g")==norm).first()
-            if email:dup=dup or Lead.query.filter(func.lower(Lead.email)==email).first()
-            if dup:skipped+=1;continue
-            assignee_id=None
-            if row.get("ambassador_email"):
-                a=User.query.filter(func.lower(User.email)==row["ambassador_email"].strip().lower(),User.role=="ambassador").first();assignee_id=a.id if a else None
+        f = request.files.get("file")
+
+        if not f:
+            return jsonify({
+                "error": "CSV file is required."
+            }), 400
+
+        try:
+            textdata = f.read().decode(
+                "utf-8-sig"
+            )
+        except UnicodeDecodeError:
+            return jsonify({
+                "error": "CSV must be UTF-8 encoded."
+            }), 400
+
+        reader = csv.DictReader(
+            io.StringIO(textdata)
+        )
+
+        required = {
+            "full_name",
+            "phone"
+        }
+
+        if not required.issubset(
+            {
+                x.strip()
+                for x in (
+                    reader.fieldnames or []
+                )
+            }
+        ):
+            return jsonify({
+                "error": (
+                    "CSV must include "
+                    "full_name and phone columns."
+                )
+            }), 400
+
+        created = 0
+        skipped = 0
+        errors = []
+
+        for i, row in enumerate(
+            reader,
+            start=2
+        ):
+            if i > 5002:
+                break
+
+            name = str(
+                row.get(
+                    "full_name",
+                    ""
+                )
+            ).strip()
+
+            phone = str(
+                row.get(
+                    "phone",
+                    ""
+                )
+            ).strip()
+
+            email = (
+                str(
+                    row.get(
+                        "email",
+                        ""
+                    )
+                ).strip().lower()
+                or None
+            )
+
+            if not name or not phone:
+                skipped += 1
+
+                errors.append(
+                    f"Row {i}: missing name or phone"
+                )
+
+                continue
+
+            norm = normalize_phone(
+                phone
+            )
+
+            dup = Lead.query.filter(
+                func.regexp_replace(
+                    Lead.phone,
+                    r"[^0-9]+",
+                    "",
+                    "g"
+                ) == norm
+            ).first()
+
+            if email:
+                dup = (
+                    dup
+                    or Lead.query.filter(
+                        func.lower(
+                            Lead.email
+                        ) == email
+                    ).first()
+                )
+
+            if dup:
+                skipped += 1
+                continue
+
+            assignee_id = None
+
+            if row.get(
+                "ambassador_email"
+            ):
+                a = User.query.filter(
+                    func.lower(
+                        User.email
+                    ) == row[
+                        "ambassador_email"
+                    ].strip().lower(),
+                    User.role == "ambassador"
+                ).first()
+
+                assignee_id = (
+                    a.id
+                    if a
+                    else None
+                )
+
             if not assignee_id:
-                a=User.query.filter_by(role="ambassador",account_status="active").order_by(User.id.asc()).first()
-                if not a:skipped+=1;continue
-                assignee_id=a.id
-            lead=Lead(ambassador_id=assignee_id,full_name=name[:120],phone=phone[:40],email=email,city=str(row.get("city","")).strip() or None,institution=str(row.get("institution","")).strip() or None,program_interest=str(row.get("program_interest","")).strip() or None,source=str(row.get("source","")).strip() or "import",notes=str(row.get("notes","")).strip() or None,approval_status="accepted",status=str(row.get("status","new")) if row.get("status") in PIPELINE else "new",priority=str(row.get("priority","medium")) if row.get("priority") in PRIORITY else "medium")
-            db.session.add(lead);db.session.flush();created+=1
-        audit(user.id,"leads_imported",None,None,f"Imported {created} leads; skipped {skipped}");db.session.commit();return jsonify({"created":created,"skipped":skipped,"errors":errors[:20]})
+                a = User.query.filter_by(
+                    role="ambassador",
+                    account_status="active"
+                ).order_by(
+                    User.id.asc()
+                ).first()
+
+                if not a:
+                    skipped += 1
+                    continue
+
+                assignee_id = a.id
+
+            lead = Lead(
+                ambassador_id=assignee_id,
+                full_name=name[:120],
+                phone=phone[:40],
+                email=email,
+                city=str(
+                    row.get(
+                        "city",
+                        ""
+                    )
+                ).strip() or None,
+                institution=str(
+                    row.get(
+                        "institution",
+                        ""
+                    )
+                ).strip() or None,
+                program_interest=str(
+                    row.get(
+                        "program_interest",
+                        ""
+                    )
+                ).strip() or None,
+                source=str(
+                    row.get(
+                        "source",
+                        ""
+                    )
+                ).strip() or "import",
+                notes=str(
+                    row.get(
+                        "notes",
+                        ""
+                    )
+                ).strip() or None,
+                approval_status="accepted",
+                status=(
+                    str(
+                        row.get(
+                            "status",
+                            "new"
+                        )
+                    )
+                    if row.get("status")
+                    in PIPELINE
+                    else "new"
+                ),
+                priority=(
+                    str(
+                        row.get(
+                            "priority",
+                            "medium"
+                        )
+                    )
+                    if row.get("priority")
+                    in PRIORITY
+                    else "medium"
+                )
+            )
+
+            db.session.add(lead)
+            db.session.flush()
+
+            created += 1
+
+        audit(
+            user.id,
+            "leads_imported",
+            None,
+            None,
+            f"Imported {created} leads; skipped {skipped}"
+        )
+
+        db.session.commit()
+
+        return jsonify({
+            "created": created,
+            "skipped": skipped,
+            "errors": errors[:20]
+        })
 
     @app.post("/api/admin/leads/merge")
     @require_user("admin")
     def merge_leads(user):
-        d=request.get_json(silent=True) or {}
-        try:keep=db.session.get(Lead,int(d.get("keep_id")));remove=db.session.get(Lead,int(d.get("remove_id")))
-        except (TypeError,ValueError):keep=remove=None
-        if not keep or not remove or keep.id==remove.id:return jsonify({"error":"Two different valid leads are required."}),400
-        for a in list(remove.activities):a.lead_id=keep.id
-        for t in list(remove.tasks):t.lead_id=keep.id
-        if not keep.email:keep.email=remove.email
-        if not keep.institution:keep.institution=remove.institution
-        if not keep.notes:keep.notes=remove.notes
-        audit(user.id,"leads_merged","lead",keep.id,f"Merged lead #{remove.id} into #{keep.id}")
-        db.session.delete(remove);db.session.commit();return jsonify({"message":"Leads merged.","lead":keep.to_dict()})
+        d = request.get_json(silent=True) or {}
+
+        try:
+            keep = db.session.get(
+                Lead,
+                int(d.get("keep_id"))
+            )
+
+            remove = db.session.get(
+                Lead,
+                int(d.get("remove_id"))
+            )
+
+        except (
+            TypeError,
+            ValueError
+        ):
+            keep = None
+            remove = None
+
+        if (
+            not keep
+            or not remove
+            or keep.id == remove.id
+        ):
+            return jsonify({
+                "error": "Two different valid leads are required."
+            }), 400
+
+        for a in list(
+            remove.activities
+        ):
+            a.lead_id = keep.id
+
+        for t in list(
+            remove.tasks
+        ):
+            t.lead_id = keep.id
+
+        if not keep.email:
+            keep.email = remove.email
+
+        if not keep.institution:
+            keep.institution = remove.institution
+
+        if not keep.notes:
+            keep.notes = remove.notes
+
+        audit(
+            user.id,
+            "leads_merged",
+            "lead",
+            keep.id,
+            f"Merged lead #{remove.id} into #{keep.id}"
+        )
+
+        db.session.delete(remove)
+        db.session.commit()
+
+        return jsonify({
+            "message": "Leads merged.",
+            "lead": keep.to_dict()
+        })
 
     return app
 
 
 def migrate_legacy_schema():
-    """Idempotent compatibility migration for databases created by older LMS builds.
-
-    Flask-SQLAlchemy's create_all() creates missing tables but does not add missing
-    columns to existing tables. The production build therefore performs a small,
-    explicit PostgreSQL migration at startup so existing installations keep working.
     """
-    inspector = inspect(db.engine)
-    tables = set(inspector.get_table_names())
+    Idempotent compatibility migration for databases created
+    by older LMS builds.
+
+    Flask-SQLAlchemy's create_all() creates missing tables but
+    does not add missing columns to existing tables.
+
+    The production build therefore performs a small,
+    explicit PostgreSQL migration at startup so existing
+    installations keep working.
+    """
+
+    inspector = inspect(
+        db.engine
+    )
+
+    tables = set(
+        inspector.get_table_names()
+    )
 
     if "users" in tables:
-        cols = {c["name"] for c in inspector.get_columns("users")}
+        cols = {
+            c["name"]
+            for c in inspector.get_columns(
+                "users"
+            )
+        }
+
         if "account_status" not in cols:
             if "is_active" in cols:
-                db.session.execute(text("ALTER TABLE users ADD COLUMN account_status VARCHAR(20) NOT NULL DEFAULT 'active'"))
-                db.session.execute(text("UPDATE users SET account_status = CASE WHEN COALESCE(is_active, TRUE) THEN 'active' ELSE 'blocked' END"))
+                db.session.execute(
+                    text(
+                        "ALTER TABLE users "
+                        "ADD COLUMN account_status "
+                        "VARCHAR(20) NOT NULL DEFAULT 'active'"
+                    )
+                )
+
+                db.session.execute(
+                    text(
+                        "UPDATE users SET account_status = "
+                        "CASE WHEN COALESCE(is_active, TRUE) "
+                        "THEN 'active' ELSE 'blocked' END"
+                    )
+                )
+
             else:
-                db.session.execute(text("ALTER TABLE users ADD COLUMN account_status VARCHAR(20) NOT NULL DEFAULT 'active'"))
+                db.session.execute(
+                    text(
+                        "ALTER TABLE users "
+                        "ADD COLUMN account_status "
+                        "VARCHAR(20) NOT NULL DEFAULT 'active'"
+                    )
+                )
+
         if "is_active" not in cols:
-            db.session.execute(text("ALTER TABLE users ADD COLUMN is_active BOOLEAN NOT NULL DEFAULT TRUE"))
-            db.session.execute(text("UPDATE users SET is_active = (account_status = 'active')"))
+            db.session.execute(
+                text(
+                    "ALTER TABLE users "
+                    "ADD COLUMN is_active "
+                    "BOOLEAN NOT NULL DEFAULT TRUE"
+                )
+            )
+
+            db.session.execute(
+                text(
+                    "UPDATE users SET is_active = "
+                    "(account_status = 'active')"
+                )
+            )
+
         if "updated_at" not in cols:
-            db.session.execute(text("ALTER TABLE users ADD COLUMN updated_at TIMESTAMPTZ"))
+            db.session.execute(
+                text(
+                    "ALTER TABLE users "
+                    "ADD COLUMN updated_at TIMESTAMPTZ"
+                )
+            )
+
         if "last_login_at" not in cols:
-            db.session.execute(text("ALTER TABLE users ADD COLUMN last_login_at TIMESTAMPTZ"))
-        # Keep the legacy flag synchronized enough for old rows/apps while the LMS
-        # uses account_status for authorization decisions.
-        db.session.execute(text("UPDATE users SET is_active = (account_status = 'active') WHERE is_active IS DISTINCT FROM (account_status = 'active')"))
+            db.session.execute(
+                text(
+                    "ALTER TABLE users "
+                    "ADD COLUMN last_login_at TIMESTAMPTZ"
+                )
+            )
+
+        # Keep the legacy flag synchronized enough for old
+        # rows/apps while the LMS uses account_status for
+        # authorization decisions.
+        db.session.execute(
+            text(
+                "UPDATE users SET is_active = "
+                "(account_status = 'active') "
+                "WHERE is_active IS DISTINCT FROM "
+                "(account_status = 'active')"
+            )
+        )
 
     if "leads" in tables:
-        cols = {c["name"] for c in inspector.get_columns("leads")}
-        adds = {
-            "approval_status": "VARCHAR(30) NOT NULL DEFAULT 'accepted'",
-            "rejection_reason": "VARCHAR(500)",
-            "priority": "VARCHAR(20) NOT NULL DEFAULT 'medium'",
-            "last_contacted_at": "TIMESTAMPTZ",
-            "next_follow_up_at": "TIMESTAMPTZ",
+        cols = {
+            c["name"]
+            for c in inspector.get_columns(
+                "leads"
+            )
         }
+
+        adds = {
+            "approval_status":
+                "VARCHAR(30) NOT NULL DEFAULT 'accepted'",
+            "rejection_reason":
+                "VARCHAR(500)",
+            "priority":
+                "VARCHAR(20) NOT NULL DEFAULT 'medium'",
+            "last_contacted_at":
+                "TIMESTAMPTZ",
+            "next_follow_up_at":
+                "TIMESTAMPTZ",
+        }
+
         for name, ddl in adds.items():
             if name not in cols:
-                db.session.execute(text(f"ALTER TABLE leads ADD COLUMN {name} {ddl}"))
+                db.session.execute(
+                    text(
+                        f"ALTER TABLE leads "
+                        f"ADD COLUMN {name} {ddl}"
+                    )
+                )
 
     if "audit_logs" in tables:
-        cols = {c["name"] for c in inspector.get_columns("audit_logs")}
+        cols = {
+            c["name"]
+            for c in inspector.get_columns(
+                "audit_logs"
+            )
+        }
+
         if "ip_address" not in cols:
-            db.session.execute(text("ALTER TABLE audit_logs ADD COLUMN ip_address VARCHAR(64)"))
+            db.session.execute(
+                text(
+                    "ALTER TABLE audit_logs "
+                    "ADD COLUMN ip_address VARCHAR(64)"
+                )
+            )
+
         if "user_agent" not in cols:
-            db.session.execute(text("ALTER TABLE audit_logs ADD COLUMN user_agent VARCHAR(500)"))
+            db.session.execute(
+                text(
+                    "ALTER TABLE audit_logs "
+                    "ADD COLUMN user_agent VARCHAR(500)"
+                )
+            )
 
     if "refresh_sessions" in tables:
-        db.session.execute(text("DELETE FROM refresh_sessions WHERE expires_at < NOW() - INTERVAL '30 days'"))
+        db.session.execute(
+            text(
+                "DELETE FROM refresh_sessions "
+                "WHERE expires_at < NOW() "
+                "- INTERVAL '30 days'"
+            )
+        )
+
     db.session.commit()
 
+
 if __name__ == "__main__":
-    create_app().run(host=os.getenv("HOST","127.0.0.1"), port=int(os.getenv("PORT","5000")), debug=Config.APP_ENV!="production")
+    create_app().run(
+        host=os.getenv(
+            "HOST",
+            "127.0.0.1"
+        ),
+        port=int(
+            os.getenv(
+                "PORT",
+                "5000"
+            )
+        ),
+        debug=Config.APP_ENV != "production"
+    )
