@@ -18,7 +18,7 @@ class Config:
     JWT_TOKEN_LOCATION = ["cookies"]
     JWT_ACCESS_COOKIE_NAME = "wf_access"
     JWT_REFRESH_COOKIE_NAME = "wf_refresh"
-    JWT_ACCESS_TOKEN_EXPIRES = 15 * 60
+    JWT_ACCESS_TOKEN_EXPIRES = 60 * 60
     JWT_REFRESH_TOKEN_EXPIRES = 7 * 24 * 60 * 60
     JWT_COOKIE_SECURE = as_bool("JWT_COOKIE_SECURE", False)
     JWT_COOKIE_SAMESITE = os.getenv("JWT_COOKIE_SAMESITE", "Lax")
