@@ -6,3 +6,5 @@ dist/
 backend/uploads/
 *.log
 .vscode/
+
+.vercel

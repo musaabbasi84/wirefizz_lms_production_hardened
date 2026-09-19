@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 from werkzeug.security import generate_password_hash, check_password_hash
 from extensions import db
-from sqlalchemy import text
+from sqlalchemy import text, func
 
 def now():
     return datetime.now(timezone.utc)
@@ -33,7 +33,12 @@ class User(db.Model):
                 "role": self.role, "account_status": self.account_status, "is_active": self.is_active,
                 "profile_picture": self.profile_picture, "created_at": self.created_at.isoformat() if self.created_at else None,
                 "last_login_at": self.last_login_at.isoformat() if self.last_login_at else None,
-                "lead_count": len(self.leads or [])}
+                "lead_count": self.lead_count()}
+
+    def lead_count(self):
+        if self.id is None:
+            return 0
+        return db.session.query(func.count(Lead.id)).filter(Lead.ambassador_id == self.id).scalar() or 0
 
 class Lead(db.Model):
     __tablename__ = "leads"
@@ -158,3 +163,18 @@ class AuditLog(db.Model):
         return {"id": self.id, "user_id": self.user_id, "user_name": self.user.full_name if self.user else "System",
                 "action": self.action, "entity_type": self.entity_type, "entity_id": self.entity_id,
                 "details": self.details, "ip_address": self.ip_address, "created_at": self.created_at.isoformat()}
+
+
+class Avatar(db.Model):
+    """Profile pictures are stored in the database.
+
+    Render's filesystem is ephemeral, so files written to ./uploads disappear on
+    every deploy / restart. Keeping the (small, re-encoded) image in PostgreSQL
+    makes avatars survive redeploys.
+    """
+    __tablename__ = "avatars"
+    filename = db.Column(db.String(120), primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    mimetype = db.Column(db.String(50), nullable=False)
+    data = db.Column(db.LargeBinary, nullable=False)
+    created_at = db.Column(db.DateTime(timezone=True), nullable=False, default=now)

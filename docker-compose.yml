@@ -35,8 +35,7 @@ services:
       JWT_SECRET_KEY: ${JWT_SECRET_KEY}
       DATABASE_URL: postgresql+psycopg://postgres:${POSTGRES_PASSWORD}@db:5432/wirefizz_lms
       CORS_ORIGINS: ${CORS_ORIGINS}
-      JWT_COOKIE_SECURE: "true"
-      JWT_COOKIE_SAMESITE: Lax
+      TRUST_PROXY: "true"
       UPLOAD_DIR: /app/uploads
       RATELIMIT_STORAGE_URI: ${RATELIMIT_STORAGE_URI:-redis://redis:6379/0}
       AUTO_APPROVE_REGISTRATION: "false"

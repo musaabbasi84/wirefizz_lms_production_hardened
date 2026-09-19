@@ -8,22 +8,18 @@ from flask_jwt_extended import (
     create_access_token,
     create_refresh_token,
     decode_token,
-    get_csrf_token,
     get_jwt,
     get_jwt_identity,
     jwt_required,
-    set_access_cookies,
-    set_refresh_cookies,
-    unset_jwt_cookies,
 )
 from sqlalchemy import func, or_, inspect, text, case
 from email_validator import validate_email, EmailNotValidError
 from werkzeug.utils import secure_filename
-from PIL import Image, UnidentifiedImageError
+from PIL import Image, UnidentifiedImageError, ImageOps
 
 from config import Config
-from extensions import db, jwt, cors, limiter
-from models import User, Lead, LeadActivity, Task, Notification, AuditLog, RefreshSession, now
+from extensions import db, jwt, cors, limiter, client_ip
+from models import User, Lead, LeadActivity, Task, Notification, AuditLog, RefreshSession, Avatar, now
 
 PIPELINE = {"new", "contacted", "qualified", "follow_up", "converted"}
 APPROVAL = {"pending", "accepted", "rejected"}
@@ -31,6 +27,7 @@ PRIORITY = {"low", "medium", "high"}
 ACTIVITY = {"note", "call", "meeting", "email", "status_change", "assignment", "system"}
 IMAGE_EXT = {"png", "jpg", "jpeg", "webp"}
 IMAGE_MIME = {"image/png", "image/jpeg", "image/webp"}
+Image.MAX_IMAGE_PIXELS = 25_000_000
 
 
 def parse_dt(value):
@@ -45,6 +42,19 @@ def parse_dt(value):
 
 def normalize_phone(v):
     return "".join(ch for ch in str(v or "") if ch.isdigit())
+
+
+def valid_email(value):
+    """True when the address is syntactically valid.
+
+    check_deliverability is disabled: a DNS lookup on every request is slow,
+    can fail on hosting platforms, and must never block a legitimate signup.
+    """
+    try:
+        validate_email(value, check_deliverability=False)
+        return True
+    except EmailNotValidError:
+        return False
 
 
 def paginated(query, default=25, max_per=100):
@@ -84,27 +94,33 @@ def create_app():
     jwt.init_app(app)
     limiter.init_app(app)
 
+    # Authentication uses the Authorization header (no cookies), so CORS does
+    # not need credentials. Only the configured frontend origin(s) are allowed.
     cors.init_app(
         app,
         resources={
             r"/api/*": {
                 "origins": Config.CORS_ORIGINS,
-                "supports_credentials": True
+                "allow_headers": ["Authorization", "Content-Type"],
+                "methods": ["GET", "POST", "PATCH", "PUT", "DELETE", "OPTIONS"],
+                "expose_headers": ["Content-Disposition"],
+                "max_age": 86400,
+                "supports_credentials": False
             }
-        },
-        supports_credentials=True
+        }
     )
 
+    # Legacy folder, only used to serve avatars uploaded by older builds.
     upload_dir = Path(Config.UPLOAD_DIR)
     avatar_dir = upload_dir / "profile"
-    avatar_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        avatar_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
 
     with app.app_context():
-        db.create_all()
-
-        # Compatibility bootstrap for earlier WireFizz databases.
-        # For new production databases, run migrations before startup.
-        migrate_legacy_schema()
+        bootstrap_database()
 
     @app.after_request
     def security_headers(resp):
@@ -144,6 +160,27 @@ def create_app():
         return jsonify({
             "error": "Too many requests. Please try again shortly."
         }), 429
+
+    @app.errorhandler(404)
+    def not_found(_):
+        return jsonify({
+            "error": "Not found."
+        }), 404
+
+    @app.errorhandler(405)
+    def method_not_allowed(_):
+        return jsonify({
+            "error": "Method not allowed."
+        }), 405
+
+    @app.errorhandler(500)
+    def server_error(error):
+        db.session.rollback()
+        app.logger.exception("Unhandled server error: %s", error)
+
+        return jsonify({
+            "error": "Something went wrong on the server. Please try again."
+        }), 500
 
     @jwt.unauthorized_loader
     def jwt_missing(_):
@@ -220,10 +257,7 @@ def create_app():
                 entity_type=entity_type,
                 entity_id=entity_id,
                 details=(details or "")[:2000],
-                ip_address=request.headers.get(
-                    "X-Forwarded-For",
-                    request.remote_addr
-                ),
+                ip_address=client_ip(),
                 user_agent=request.headers.get(
                     "User-Agent",
                     ""
@@ -252,6 +286,27 @@ def create_app():
 
     def visible_lead(user, lead):
         return user.role == "admin" or lead.ambassador_id == user.id
+
+    def find_duplicate_lead(phone, email):
+        norm = normalize_phone(phone)
+        dup = None
+
+        if norm:
+            dup = Lead.query.filter(
+                func.regexp_replace(
+                    Lead.phone,
+                    r"[^0-9]+",
+                    "",
+                    "g"
+                ) == norm
+            ).first()
+
+        if not dup and email:
+            dup = Lead.query.filter(
+                func.lower(Lead.email) == email
+            ).first()
+
+        return dup
 
     @app.get("/api/health")
     @limiter.exempt
@@ -304,9 +359,7 @@ def create_app():
                 "error": "Full name is too long."
             }), 400
 
-        try:
-            validate_email(email)
-        except EmailNotValidError:
+        if not valid_email(email):
             return jsonify({
                 "error": "Please provide a valid email address."
             }), 400
@@ -357,10 +410,18 @@ def create_app():
             "message": "Account created. You can now sign in."
         }), 201
 
-    # IMPORTANT:
-    # This function must stay INSIDE create_app().
-    # It creates the access/refresh cookies and returns their CSRF tokens.
+    def no_store(response):
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["Pragma"] = "no-cache"
+        return response
+
     def issue_session(user):
+        """Create an access + refresh token pair and persist the refresh session.
+
+        Tokens are returned in the JSON body; the SPA sends the access token in
+        the Authorization header. No cookies are involved, so this works for a
+        frontend and API on different domains (Vercel + Render).
+        """
         access = create_access_token(
             identity=str(user.id),
             additional_claims={
@@ -375,23 +436,13 @@ def create_app():
             }
         )
 
-        access_claims = decode_token(
-            access,
-            allow_expired=False
-        )
-
-        refresh_claims = decode_token(
-            refresh,
-            allow_expired=False
-        )
-
-        now_utc = now()
+        refresh_claims = decode_token(refresh)
 
         db.session.add(
             RefreshSession(
                 user_id=user.id,
                 jti=refresh_claims["jti"],
-                issued_at=now_utc,
+                issued_at=now(),
                 expires_at=datetime.fromtimestamp(
                     refresh_claims["exp"],
                     tz=timezone.utc
@@ -400,64 +451,21 @@ def create_app():
                     "User-Agent",
                     ""
                 )[:500],
-                ip_address=request.headers.get(
-                    "X-Forwarded-For",
-                    request.remote_addr
-                )
+                ip_address=client_ip()
             )
         )
 
         db.session.commit()
 
-        response = jsonify({
+        return no_store(jsonify({
             "user": user.to_dict(),
-            "csrf_token": get_csrf_token(access_claims),
-            "refresh_csrf_token": get_csrf_token(refresh_claims)
-        })
-
-        set_access_cookies(
-            response,
-            access
-        )
-
-        set_refresh_cookies(
-            response,
-            refresh
-        )
-
-        return response
-
-    # Cross-domain CSRF helper.
-    #
-    # Frontend is hosted on Vercel while API is hosted on Render.
-    # Browser sends Render cookies with credentials, but JavaScript
-    # running on Vercel cannot read Render's document.cookie.
-    #
-    # This endpoint returns ONLY the CSRF tokens, never the JWT tokens.
-    @app.get("/api/auth/csrf")
-    @limiter.exempt
-    def csrf_tokens():
-        access_csrf = request.cookies.get(
-            Config.JWT_ACCESS_CSRF_COOKIE_NAME
-        )
-
-        refresh_csrf = request.cookies.get(
-            Config.JWT_REFRESH_CSRF_COOKIE_NAME
-        )
-
-        if not access_csrf and not refresh_csrf:
-            return jsonify({
-                "error": "No active session."
-            }), 401
-
-        response = jsonify({
-            "access_csrf": access_csrf,
-            "refresh_csrf": refresh_csrf
-        })
-
-        response.headers["Cache-Control"] = "no-store"
-
-        return response
+            "access_token": access,
+            "refresh_token": refresh,
+            "token_type": "Bearer",
+            "expires_in": int(
+                Config.JWT_ACCESS_TOKEN_EXPIRES
+            )
+        }))
 
     @app.post("/api/auth/login")
     @limiter.limit("10 per minute")
@@ -468,9 +476,11 @@ def create_app():
             data.get("email", "")
         ).strip().lower()
 
-        password = data.get(
-            "password",
-            ""
+        password = str(
+            data.get(
+                "password",
+                ""
+            )
         )
 
         user = User.query.filter(
@@ -507,7 +517,7 @@ def create_app():
         return issue_session(user)
 
     @app.post("/api/auth/refresh")
-    @limiter.limit("30 per minute")
+    @limiter.limit("60 per minute")
     @jwt_required(refresh=True)
     def refresh():
         claims = get_jwt()
@@ -542,37 +552,48 @@ def create_app():
 
     @app.post("/api/auth/logout")
     def logout():
-        # Revoke the refresh token if one is present.
-        # Logout remains idempotent after access-token expiry.
+        # Revokes the refresh session (sent in the JSON body or as a Bearer
+        # token). Idempotent: works even when the access token has expired.
+        body = request.get_json(silent=True) or {}
+        candidates = [body.get("refresh_token")]
+        header = request.headers.get("Authorization", "")
+
+        if header.lower().startswith("bearer "):
+            candidates.append(header[7:].strip())
+
         user = None
 
-        try:
-            from flask_jwt_extended import verify_jwt_in_request
+        for candidate in candidates:
+            if not candidate or not isinstance(candidate, str):
+                continue
 
-            verify_jwt_in_request(
-                optional=True,
-                refresh=True
-            )
+            try:
+                claims = decode_token(
+                    candidate,
+                    allow_expired=True
+                )
+            except Exception:
+                continue
 
-            claims = get_jwt()
-            ident = get_jwt_identity()
+            if claims.get("type") != "refresh":
+                continue
 
-            if ident is not None:
+            session = RefreshSession.query.filter_by(
+                jti=claims.get("jti")
+            ).first()
+
+            if session and not session.revoked_at:
+                session.revoked_at = now()
+
+            try:
                 user = db.session.get(
                     User,
-                    int(ident)
+                    int(claims.get("sub"))
                 )
+            except (TypeError, ValueError):
+                user = None
 
-            if claims.get("jti"):
-                session = RefreshSession.query.filter_by(
-                    jti=claims["jti"]
-                ).first()
-
-                if session and not session.revoked_at:
-                    session.revoked_at = now()
-
-        except Exception:
-            pass
+            break
 
         if user:
             audit(
@@ -585,13 +606,9 @@ def create_app():
 
         db.session.commit()
 
-        resp = jsonify({
+        return jsonify({
             "message": "Signed out."
         })
-
-        unset_jwt_cookies(resp)
-
-        return resp
 
     @app.get("/api/auth/me")
     @require_user("admin", "ambassador")
@@ -603,10 +620,45 @@ def create_app():
     @app.get("/api/uploads/profile/<path:filename>")
     @limiter.exempt
     def profile_image(filename):
-        return send_from_directory(
-            avatar_dir,
-            secure_filename(filename)
-        )
+        safe = secure_filename(filename)
+
+        avatar = db.session.get(
+            Avatar,
+            safe
+        ) if safe else None
+
+        if avatar:
+            resp = Response(
+                avatar.data,
+                mimetype=avatar.mimetype
+            )
+
+            resp.headers["Cache-Control"] = (
+                "public, max-age=31536000, immutable"
+            )
+
+            resp.headers["Cross-Origin-Resource-Policy"] = (
+                "cross-origin"
+            )
+
+            return resp
+
+        # Avatars uploaded by older builds lived on disk.
+        if safe and (avatar_dir / safe).is_file():
+            resp = send_from_directory(
+                avatar_dir,
+                safe
+            )
+
+            resp.headers["Cross-Origin-Resource-Policy"] = (
+                "cross-origin"
+            )
+
+            return resp
+
+        return jsonify({
+            "error": "Image not found."
+        }), 404
 
     @app.get("/api/profile")
     @require_user("admin", "ambassador")
@@ -657,6 +709,28 @@ def create_app():
             "user": user.to_dict()
         })
 
+    def drop_avatar(url):
+        """Delete the stored image behind a /api/uploads/profile/<name> URL."""
+        if not url or not url.startswith("/api/uploads/profile/"):
+            return
+
+        name = secure_filename(Path(url).name)
+
+        if not name:
+            return
+
+        Avatar.query.filter_by(
+            filename=name
+        ).delete()
+
+        legacy = avatar_dir / name
+
+        try:
+            if legacy.is_file():
+                legacy.unlink()
+        except OSError:
+            pass
+
     @app.post("/api/profile/avatar")
     @require_user("admin", "ambassador")
     def upload_avatar(user):
@@ -679,29 +753,67 @@ def create_app():
             }), 400
 
         try:
-            image = Image.open(f.stream)
-            image.verify()
-            f.stream.seek(0)
-        except (
-            UnidentifiedImageError,
-            OSError
-        ):
+            raw = f.read()
+            probe = Image.open(io.BytesIO(raw))
+            probe.verify()
+
+            # verify() invalidates the object, so re-open to decode.
+            image = Image.open(io.BytesIO(raw))
+            image = ImageOps.exif_transpose(image)
+            image.thumbnail((512, 512))
+
+            has_alpha = (
+                image.mode in ("RGBA", "LA")
+                or (
+                    image.mode == "P"
+                    and "transparency" in image.info
+                )
+            )
+
+            buffer = io.BytesIO()
+
+            if has_alpha:
+                image.convert("RGBA").save(
+                    buffer,
+                    format="PNG",
+                    optimize=True
+                )
+
+                out_ext, out_mime = "png", "image/png"
+
+            else:
+                image.convert("RGB").save(
+                    buffer,
+                    format="JPEG",
+                    quality=88,
+                    optimize=True
+                )
+
+                out_ext, out_mime = "jpg", "image/jpeg"
+
+        except Exception:
             return jsonify({
                 "error": "The uploaded file is not a valid image."
             }), 400
 
-        filename = (
-            f"{user.id}_{uuid.uuid4().hex}.{ext}"
-        )
+        filename = f"{user.id}_{uuid.uuid4().hex}.{out_ext}"
 
-        target = avatar_dir / filename
-        f.save(target)
+        db.session.add(
+            Avatar(
+                filename=filename,
+                user_id=user.id,
+                mimetype=out_mime,
+                data=buffer.getvalue()
+            )
+        )
 
         old = user.profile_picture
 
         user.profile_picture = (
             f"/api/uploads/profile/{filename}"
         )
+
+        drop_avatar(old)
 
         audit(
             user.id,
@@ -712,14 +824,6 @@ def create_app():
         )
 
         db.session.commit()
-
-        if old and old.startswith(
-            "/api/uploads/profile/"
-        ):
-            p = avatar_dir / Path(old).name
-
-            if p.exists():
-                p.unlink(missing_ok=True)
 
         return jsonify({
             "message": "Profile picture updated.",
@@ -732,6 +836,8 @@ def create_app():
         old = user.profile_picture
         user.profile_picture = None
 
+        drop_avatar(old)
+
         audit(
             user.id,
             "profile_picture_removed",
@@ -741,14 +847,6 @@ def create_app():
         )
 
         db.session.commit()
-
-        if old and old.startswith(
-            "/api/uploads/profile/"
-        ):
-            p = avatar_dir / Path(old).name
-
-            if p.exists():
-                p.unlink(missing_ok=True)
 
         return jsonify({
             "message": "Profile picture removed.",
@@ -800,13 +898,9 @@ def create_app():
 
         db.session.commit()
 
-        resp = jsonify({
+        return jsonify({
             "message": "Password changed. Please sign in again."
         })
-
-        unset_jwt_cookies(resp)
-
-        return resp
 
     @app.get("/api/dashboard/stats")
     @require_user("admin", "ambassador")
@@ -960,32 +1054,12 @@ def create_app():
                 "error": "Lead name and phone are required."
             }), 400
 
-        if email:
-            try:
-                validate_email(email)
-            except EmailNotValidError:
-                return jsonify({
-                    "error": "Lead email is invalid."
-                }), 400
+        if email and not valid_email(email):
+            return jsonify({
+                "error": "Lead email is invalid."
+            }), 400
 
-        norm = normalize_phone(phone)
-
-        dup = Lead.query.filter(
-            func.regexp_replace(
-                Lead.phone,
-                r"[^0-9]+",
-                "",
-                "g"
-            ) == norm
-        ).first()
-
-        if email:
-            dup = (
-                dup
-                or Lead.query.filter(
-                    func.lower(Lead.email) == email
-                ).first()
-            )
+        dup = find_duplicate_lead(phone, email)
 
         if dup:
             return jsonify({
@@ -1293,15 +1367,24 @@ def create_app():
             "notes"
         ]:
             if field in d:
-                setattr(
-                    lead,
-                    field,
-                    (
-                        str(d[field]).strip()
-                        if d[field] is not None
-                        else None
-                    )
+                value = (
+                    str(d[field]).strip()
+                    if d[field] is not None
+                    else ""
                 )
+
+                if field == "email":
+                    value = value.lower()
+
+                    if value and not valid_email(value):
+                        return jsonify({
+                            "error": "Lead email is invalid."
+                        }), 400
+
+                if field in {"full_name", "phone"}:
+                    setattr(lead, field, value[:120 if field == "full_name" else 40])
+                else:
+                    setattr(lead, field, value or None)
 
         if "next_follow_up_at" in d:
             lead.next_follow_up_at = parse_dt(
@@ -1466,14 +1549,21 @@ def create_app():
                 lead.priority = d["priority"]
 
             elif action == "assign":
-                assignee = db.session.get(
-                    User,
-                    int(
+                try:
+                    assignee_id = int(
                         d.get(
                             "ambassador_id",
                             0
                         )
                     )
+                except (TypeError, ValueError):
+                    return jsonify({
+                        "error": "Invalid assignee."
+                    }), 400
+
+                assignee = db.session.get(
+                    User,
+                    assignee_id
                 )
 
                 if (
@@ -1554,7 +1644,7 @@ def create_app():
                 assignee_id = int(
                     d["assignee_id"]
                 )
-            except ValueError:
+            except (TypeError, ValueError):
                 return jsonify({
                     "error": "Invalid assignee."
                 }), 400
@@ -1888,6 +1978,14 @@ def create_app():
                 "success"
             )
 
+        if status != "active":
+            RefreshSession.query.filter_by(
+                user_id=target.id,
+                revoked_at=None
+            ).update({
+                "revoked_at": now()
+            })
+
         if status == "blocked":
             notify(
                 target.id,
@@ -1949,9 +2047,11 @@ def create_app():
             )
         ).strip().lower()
 
-        pwd = d.get(
-            "password",
-            ""
+        pwd = str(
+            d.get(
+                "password",
+                ""
+            )
         )
 
         if (
@@ -1963,9 +2063,7 @@ def create_app():
                 "error": "Name, email and password (8+ chars) are required."
             }), 400
 
-        try:
-            validate_email(email)
-        except EmailNotValidError:
+        if not valid_email(email):
             return jsonify({
                 "error": "Invalid email."
             }), 400
@@ -2507,30 +2605,16 @@ def create_app():
 
                 continue
 
-            norm = normalize_phone(
-                phone
-            )
+            if email and not valid_email(email):
+                skipped += 1
 
-            dup = Lead.query.filter(
-                func.regexp_replace(
-                    Lead.phone,
-                    r"[^0-9]+",
-                    "",
-                    "g"
-                ) == norm
-            ).first()
-
-            if email:
-                dup = (
-                    dup
-                    or Lead.query.filter(
-                        func.lower(
-                            Lead.email
-                        ) == email
-                    ).first()
+                errors.append(
+                    f"Row {i}: invalid email"
                 )
 
-            if dup:
+                continue
+
+            if find_duplicate_lead(phone, email):
                 skipped += 1
                 continue
 
@@ -2681,15 +2765,25 @@ def create_app():
                 "error": "Two different valid leads are required."
             }), 400
 
-        for a in list(
-            remove.activities
-        ):
-            a.lead_id = keep.id
+        # Move the child rows with a bulk UPDATE, then expire the in-memory
+        # collections. Otherwise deleting `remove` would cascade to the
+        # (already re-parented) rows still listed in remove.activities/tasks
+        # and silently destroy the merged history.
+        LeadActivity.query.filter_by(
+            lead_id=remove.id
+        ).update({
+            "lead_id": keep.id
+        })
 
-        for t in list(
-            remove.tasks
-        ):
-            t.lead_id = keep.id
+        Task.query.filter_by(
+            lead_id=remove.id
+        ).update({
+            "lead_id": keep.id
+        })
+
+        db.session.flush()
+        db.session.expire(remove, ["activities", "tasks"])
+        db.session.expire(keep, ["activities", "tasks"])
 
         if not keep.email:
             keep.email = remove.email
@@ -2717,6 +2811,34 @@ def create_app():
         })
 
     return app
+
+
+def bootstrap_database():
+    """Create tables + run the compatibility migration exactly once at a time.
+
+    Gunicorn starts several workers at the same moment; without a lock they race
+    on CREATE TABLE / ALTER TABLE against a fresh database and one of them
+    crashes. A PostgreSQL advisory lock serialises the bootstrap.
+    """
+    lock_id = 727463726  # arbitrary application-wide constant
+    connection = db.engine.connect()
+
+    try:
+        if db.engine.dialect.name == "postgresql":
+            connection.execute(text("SELECT pg_advisory_lock(:id)"), {"id": lock_id})
+            connection.commit()
+
+        try:
+            db.create_all()
+            migrate_legacy_schema()
+        finally:
+            db.session.remove()
+
+            if db.engine.dialect.name == "postgresql":
+                connection.execute(text("SELECT pg_advisory_unlock(:id)"), {"id": lock_id})
+                connection.commit()
+    finally:
+        connection.close()
 
 
 def migrate_legacy_schema():

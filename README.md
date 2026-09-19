@@ -11,7 +11,7 @@ A complete campus ambassador, admissions lead and CRM workspace built around the
 5. Admin analytics + reporting
 6. Advanced operations: assignment, bulk actions, CSV import/export, duplicate detection and merge
 7. Profile management + picture upload + password change
-8. JWT access/refresh session architecture with HttpOnly cookies + CSRF protection
+8. JWT access/refresh session architecture with Bearer-token access + rotating refresh tokens
 9. Notifications + audit trail + account blocking/deletion
 10. Production packaging with Gunicorn, Nginx and Docker Compose
 
@@ -34,7 +34,7 @@ A complete campus ambassador, admissions lead and CRM workspace built around the
 
 ## Authentication model
 
-The SPA uses short-lived JWT access cookies and rotated JWT refresh cookies. Both tokens are HttpOnly; JWT CSRF protection uses a readable CSRF cookie and `X-CSRF-TOKEN` header. Refresh JTIs are persisted server-side and revoked on rotation, logout, employee blocking, and password changes. The frontend first checks `/api/auth/me` and only attempts refresh when the refresh-CSRF cookie exists, so an unauthenticated page load does not generate an expected `/api/auth/refresh` 401. A new browser tab can reuse the authenticated browser session without another login. Different accounts should be tested in separate browser profiles/incognito sessions because cookies are intentionally shared by tabs of the same browser profile.
+The SPA sends a short-lived JWT access token in the `Authorization: Bearer` header. A rotating refresh token (persisted server-side in `refresh_sessions`) is used to obtain new access tokens. Refresh tokens are revoked on rotation, logout, employee blocking and password change. No cookies are used, so the frontend (e.g. Vercel) and API (e.g. Render) can live on different domains and no CSRF token is required. Tokens are kept in the browser's `localStorage`; a Web Lock prevents two tabs from rotating the refresh token at the same time.
 
 ## Local development
 
@@ -95,7 +95,7 @@ The frontend is served by Nginx on port 80 and proxies `/api/*` to the backend. 
 
 ### Production checklist
 
-- Use HTTPS and set `JWT_COOKIE_SECURE=true`.
+- Serve everything over HTTPS.
 - Use strong unique `SECRET_KEY`, `JWT_SECRET_KEY` and PostgreSQL credentials.
 - Set `CORS_ORIGINS` to the exact public origin(s), never `*`.
 - Redis-backed rate limiting is included in the Docker Compose deployment; for multiple external instances, use a shared Redis service.
@@ -115,6 +115,22 @@ The frontend is served by Nginx on port 80 and proxies `/api/*` to the backend. 
 - `/api/admin/users`, `/api/admin/leads/bulk`, `/api/admin/leads/merge`
 - `/api/admin/analytics`, `/api/admin/audit-logs`
 - `/api/admin/export/leads.csv`, `/api/admin/import/leads`
+
+## Vercel + Render + Neon deployment
+
+**Render (backend, root directory `backend`)**: build `pip install -r requirements.txt`, start `gunicorn run:app --timeout 120`. Environment: `APP_ENV=production`, `SECRET_KEY`, `JWT_SECRET_KEY` (32+ random chars each, keep stable), `DATABASE_URL` (Neon string), `CORS_ORIGINS=https://<your-app>.vercel.app` (exact, no trailing path), `RATELIMIT_STORAGE_URI=memory://`, optional `AUTO_APPROVE_REGISTRATION=true`. Create the admin once with `python seed_admin.py` (set `ADMIN_EMAIL`, `ADMIN_NAME`, `ADMIN_PASSWORD`). Health check: `/api/health`.
+
+**Vercel (frontend, root directory `frontend`)**: set `VITE_API_URL=https://<your-service>.onrender.com` (also defaulted in `frontend/.env.production`).
+
+Notes: Render free instances sleep after inactivity, so the first request can take ~50 s (the UI shows a retry screen). Profile pictures are stored in PostgreSQL so they survive redeploys.
+
+## Tests
+
+```bash
+createdb wirefizz_lms_test   # any empty PostgreSQL database
+pip install -r backend/requirements.txt pytest
+TEST_DATABASE_URL=postgresql+psycopg://postgres:postgres@127.0.0.1:5432/wirefizz_lms_test python -m pytest tests -q
+```
 
 ## Important limitation
 

@@ -1,9 +1,12 @@
-FROM python:3.13-slim
+FROM node:22-alpine AS build
 WORKDIR /app
-ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
-COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
+COPY package.json ./
+RUN npm install
 COPY . .
-RUN mkdir -p /app/uploads/profile
-EXPOSE 5000
-CMD ["gunicorn","-w","4","-b","0.0.0.0:5000","--access-logfile","-","--error-logfile","-","run:app"]
+RUN npm run build
+
+FROM nginx:1.27-alpine
+COPY --from=build /app/dist /usr/share/nginx/html
+COPY nginx.conf /etc/nginx/conf.d/default.conf
+EXPOSE 80
+CMD ["nginx","-g","daemon off;"]
